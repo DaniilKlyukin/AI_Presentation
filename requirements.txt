@@ -1,2 +1,5 @@
 python-pptx~=1.0.2
 marko~=2.2.2
+dotenv~=0.9.9
+python-dotenv~=1.2.2
+Pygments~=2.20.0
