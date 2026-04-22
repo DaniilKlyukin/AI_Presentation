@@ -82,10 +82,10 @@ class PptxCreator:
         filename = f"math_{uuid.uuid4().hex}.png"
         fig = plt.figure(figsize=(8, 1), dpi=300)
         try:
-            # bbox_inches='tight' уберет лишние поля
-            fig.text(0.5, 0.5, f"${formula}$", fontsize=self.body_size + 6,
+            fig.text(0.5, 0.5, f"${formula}$", fontsize=self.body_size + 4,
                      ha='center', va='center')
-            fig.savefig(filename, transparent=True, bbox_inches='tight', pad_inches=0.05)
+            # Делаем pad_inches минимальным (0.01), чтобы избежать пустых полей
+            fig.savefig(filename, transparent=True, bbox_inches='tight', pad_inches=0.01)
             plt.close(fig)
             self.temp_files.append(filename)
             return filename
@@ -97,12 +97,11 @@ class PptxCreator:
     def _process_math_blocks(self, text):
         def replacer(m):
             img_path = self._render_formula_to_image(m.group(1))
-            return f'![math]({img_path})' if img_path else m.group(0)
+            return f' ![math]({img_path}) ' if img_path else m.group(0)
 
-        # Сначала блочные (оборачиваем в \n для надежности парсера)
+        # Сначала блочные (оборачиваем в \n для надежности)
         text = re.sub(r'\$\$(.*?)\$\$', lambda m: f'\n{replacer(m)}\n', text, flags=re.DOTALL)
-
-        # Затем инлайн (не захватываем уже обработанные $$)
+        # Затем инлайн
         text = re.sub(r'(?<!\$)\$(?!\$)(.*?)(?<!\$)\$(?!\$)', replacer, text)
         return text
 
@@ -143,34 +142,42 @@ class PptxCreator:
             return text_frame.paragraphs[0]
         return text_frame.add_paragraph()
 
-    def _estimate_text_height(self, text_frame):
-        """Оценивает высоту текущего текста в дюймах, чтобы избежать наложений."""
-        total_lines = 0
-        chars_per_line = max(40, int(1200 / self.body_size))
-
+    def _get_current_tf_height(self, text_frame):
+        """Максимально точно вычисляет текущую высоту текста во фрейме в дюймах"""
+        total_pt = 0
         for p in text_frame.paragraphs:
-            text = p.text.strip()
-            if not text:
-                total_lines += 1
-            else:
-                lines = text.split('\n')
-                for line in lines:
-                    total_lines += max(1, len(line) // chars_per_line + 1)
+            if p.space_before:
+                total_pt += p.space_before.pt
 
-        line_height_inches = (self.body_size * 1.5) / 72.0
-        return total_lines * line_height_inches * self.line_spacing
+            text = p.text.strip()
+            max_size = self.body_size
+            for run in p.runs:
+                if run.font.size:
+                    max_size = max(max_size, run.font.size.pt)
+
+            if not text:
+                total_pt += max_size
+            else:
+                # Оценка длины строки (около 65 символов для размера 22 на слайде 16:9)
+                chars_per_line = max(40, int(1400 / max_size))
+                lines = (len(text) // chars_per_line) + 1
+                total_pt += lines * max_size * self.line_spacing * 1.15  # 1.15 - интерлиньяж pptx
+
+            if p.space_after:
+                total_pt += p.space_after.pt
+
+        return total_pt / 72.0
 
     # ---------------------- ВСТАВКА ИЗОБРАЖЕНИЙ И ТАБЛИЦ -----
     def _insert_image_shape(self, slide, text_frame, img_path):
         if not os.path.exists(img_path):
             return
 
-        # Рассчитываем Y координату на основе заполненности text_frame
-        top_inch = text_frame._parent.top.inches + self._estimate_text_height(text_frame) + 0.1
+        current_text_h = self._get_current_tf_height(text_frame)
+        top_inch = text_frame._parent.top.inches + current_text_h + 0.05  # 0.05 дюйма отступ
 
         pic = slide.shapes.add_picture(img_path, Inches(0), Inches(top_inch))
 
-        # Масштабируем, если картинка/формула не влезает в слайд по ширине
         max_width = self.prs.slide_width * 0.9
         if pic.width > max_width:
             ratio = max_width / pic.width
@@ -179,12 +186,13 @@ class PptxCreator:
 
         pic.left = int((self.prs.slide_width - pic.width) / 2)
 
-        # Добавляем пустые строки без маркеров, чтобы сдвинуть следующий контент ниже
-        line_height_inches = (self.body_size * 1.5) / 72.0
-        empty_lines = int(pic.height.inches / line_height_inches) + 1
-        for _ in range(empty_lines):
-            p = text_frame.add_paragraph()
-            self._remove_bullet_xml(p)
+        # Создаем прозрачный микро-абзац, отступ которого равен высоте картинки!
+        p = text_frame.add_paragraph()
+        self._remove_bullet_xml(p)
+        p.text = " "
+        p.font.size = Pt(1)
+        # Отступ равен высоте картинки + 10 пунктов для эстетичного зазора
+        p.space_before = Pt(pic.height.pt + 10)
 
     def _add_table(self, slide, text_frame, node):
         rows_nodes = node.children
@@ -193,7 +201,8 @@ class PptxCreator:
         if rows == 0 or cols == 0:
             return
 
-        top_inch = text_frame._parent.top.inches + self._estimate_text_height(text_frame) + 0.1
+        current_text_h = self._get_current_tf_height(text_frame)
+        top_inch = text_frame._parent.top.inches + current_text_h + 0.1
 
         width = int(self.prs.slide_width * 0.9)
         left = int((self.prs.slide_width - width) / 2)
@@ -215,12 +224,12 @@ class PptxCreator:
                         if r_idx == 0:
                             run.font.bold = True
 
-        # Пустые строки без маркеров, чтобы сдвинуть следующий контент
-        line_height_inches = (self.body_size * 1.5) / 72.0
-        empty_lines = int(tbl_shape.height.inches / line_height_inches) + 1
-        for _ in range(empty_lines):
-            p = text_frame.add_paragraph()
-            self._remove_bullet_xml(p)
+        # Сдвиг текста под таблицу
+        p = text_frame.add_paragraph()
+        self._remove_bullet_xml(p)
+        p.text = " "
+        p.font.size = Pt(1)
+        p.space_before = Pt(tbl_shape.height.pt + 15)
 
     # ---------------------- ПОДСВЕТКА КОДА -------------------
     def _add_highlighted_code(self, text_frame, code_text, lang='text'):
@@ -273,16 +282,17 @@ class PptxCreator:
             self._apply_paragraph_style(p, align=default_align)
 
             for child in getattr(node, 'children', []):
-                # Если посреди абзаца встретили картинку/формулу
+                # Если встретили формулу/картинку (инлайн или блочную)
                 if child.__class__.__name__ == 'Image':
                     if slide:
                         self._insert_image_shape(slide, text_frame, child.dest)
-                    # Начинаем новый параграф для текста ПОСЛЕ формулы/картинки
+
+                    # Начинаем новую строку для текста ПОСЛЕ формулы, НО отключаем маркер списка
                     p = text_frame.add_paragraph()
                     p.level = min(level, 8)
+                    self._remove_bullet_xml(p)
                     self._apply_paragraph_style(p, align=default_align)
                 else:
-                    # Добавляем текст к текущему параграфу
                     self._fill_run(p, DummyNode([child]))
 
         elif ntype == 'List':
