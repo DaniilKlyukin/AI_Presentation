@@ -10,6 +10,9 @@ from pptx.util import Pt, Inches
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
 from pptx.dml.color import RGBColor
 from pptx.oxml.xmlchemy import OxmlElement
+from pptx.oxml.ns import qn
+from copy import deepcopy
+
 
 try:
     import matplotlib.pyplot as plt
@@ -26,6 +29,12 @@ try:
     from pygments.token import Token
 except ImportError:
     Token = None
+
+# Попытка импорта конвертера LaTeX -> Unicode (для простых инлайн формул)
+try:
+    from pylatexenc.latex2text import LatexNodes2Text
+except ImportError:
+    LatexNodes2Text = None
 
 from .errors import PptxSyntaxError
 
@@ -73,6 +82,54 @@ class PptxCreator:
         w, h = ratios.get(ratio_str, ratios["16:9"])
         self.prs.slide_width, self.prs.slide_height = w, h
 
+    # ---------------------- КОНВЕРТАЦИЯ LaTeX В UNICODE -----------------
+    def _latex_to_unicode(self, latex_str):
+        """Преобразует простые LaTeX‑выражения в Unicode."""
+        if not latex_str:
+            return ""
+        if LatexNodes2Text:
+            try:
+                converter = LatexNodes2Text()
+                return converter.latex_to_text(latex_str)
+            except Exception:
+                pass
+
+        replacements = {
+            r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
+            r'\epsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η', r'\theta': 'θ',
+            r'\iota': 'ι', r'\kappa': 'κ', r'\lambda': 'λ', r'\mu': 'μ',
+            r'\nu': 'ν', r'\xi': 'ξ', r'\pi': 'π', r'\rho': 'ρ',
+            r'\sigma': 'σ', r'\tau': 'τ', r'\upsilon': 'υ', r'\phi': 'φ',
+            r'\chi': 'χ', r'\psi': 'ψ', r'\omega': 'ω',
+            r'\Gamma': 'Γ', r'\Delta': 'Δ', r'\Theta': 'Θ', r'\Lambda': 'Λ',
+            r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Upsilon': 'Υ',
+            r'\Phi': 'Φ', r'\Psi': 'Ψ', r'\Omega': 'Ω',
+            r'\times': '×', r'\div': '÷', r'\pm': '±', r'\mp': '∓',
+            r'\leq': '≤', r'\geq': '≥', r'\neq': '≠', r'\approx': '≈',
+            r'\equiv': '≡', r'\propto': '∝', r'\infty': '∞',
+            r'\int': '∫', r'\sum': '∑', r'\prod': '∏', r'\partial': '∂',
+            r'\sqrt': '√', r'\nabla': '∇',
+            r'^2': '²', r'^3': '³', r'^4': '⁴', r'^n': 'ⁿ',
+            r'_0': '₀', r'_1': '₁', r'_2': '₂', r'_3': '₃', r'_i': 'ᵢ', r'_n': 'ₙ',
+        }
+        for pat, uni in replacements.items():
+            latex_str = latex_str.replace(pat, uni)
+
+        latex_str = re.sub(r'\\[a-zA-Z]+', '', latex_str)
+        latex_str = latex_str.replace('{', '').replace('}', '')
+        latex_str = latex_str.replace('$', '')
+        return latex_str.strip()
+
+    def _is_complex_formula(self, latex_str):
+        """Определяет, является ли формула сложной (требует рендера в PNG)."""
+        # Убрана триггерная проверка на одиночные _ и ^, чтобы простые E=mc^2 оставались текстом
+        patterns = [
+            r'\\frac', r'\\int', r'\\sum', r'\\prod', r'\\sqrt\{',
+            r'\\lim', r'\\left', r'\\right', r'\\begin\{',
+            r'_\{', r'\^\{'  # Сложные индексы и степени в фигурных скобках
+        ]
+        return any(re.search(p, latex_str) for p in patterns)
+
     # ---------------------- ФОРМУЛЫ -------------------------
     def _render_formula_to_image(self, formula_text):
         if not plt:
@@ -84,7 +141,6 @@ class PptxCreator:
         try:
             fig.text(0.5, 0.5, f"${formula}$", fontsize=self.body_size + 4,
                      ha='center', va='center')
-            # Делаем pad_inches минимальным (0.01), чтобы избежать пустых полей
             fig.savefig(filename, transparent=True, bbox_inches='tight', pad_inches=0.01)
             plt.close(fig)
             self.temp_files.append(filename)
@@ -95,14 +151,27 @@ class PptxCreator:
             return None
 
     def _process_math_blocks(self, text):
-        def replacer(m):
+        """Обрабатывает блочные ($$) и инлайн ($) формулы.
+        Блочные — всегда в PNG.
+        Инлайн — если простая, в Unicode; если сложная — в PNG.
+        """
+        # Блочные формулы: заменяем на ![...](...)
+        def block_replacer(m):
             img_path = self._render_formula_to_image(m.group(1))
-            return f' ![math]({img_path}) ' if img_path else m.group(0)
+            return f'\n![math]({img_path})\n' if img_path else m.group(0)
 
-        # Сначала блочные (оборачиваем в \n для надежности)
-        text = re.sub(r'\$\$(.*?)\$\$', lambda m: f'\n{replacer(m)}\n', text, flags=re.DOTALL)
-        # Затем инлайн
-        text = re.sub(r'(?<!\$)\$(?!\$)(.*?)(?<!\$)\$(?!\$)', replacer, text)
+        text = re.sub(r'\$\$(.*?)\$\$', block_replacer, text, flags=re.DOTALL)
+
+        # Инлайн формулы: проверяем сложность
+        def inline_replacer(m):
+            latex_expr = m.group(1).strip()
+            if self._is_complex_formula(latex_expr):
+                img_path = self._render_formula_to_image(latex_expr)
+                return f'![math]({img_path})' if img_path else m.group(0)
+            else:
+                return self._latex_to_unicode(latex_expr)
+
+        text = re.sub(r'(?<!\$)\$(?!\$)(.*?)(?<!\$)\$(?!\$)', inline_replacer, text)
         return text
 
     # ---------------------- ВСПОМОГАТЕЛЬНЫЕ -----------------
@@ -114,10 +183,15 @@ class PptxCreator:
             self._remove_bullet_xml(paragraph)
 
     def _remove_bullet_xml(self, paragraph):
+        """Удаляет маркер списка, но сохраняет отступы (level)."""
         pPr = paragraph._p.get_or_add_pPr()
+        # Удаляем элемент маркера (a:buNone)
+        for elem in pPr:
+            if elem.tag.endswith('buNone'):
+                pPr.remove(elem)
+                break
         pPr.insert(0, OxmlElement('a:buNone'))
-        paragraph.left_indent = 0
-        paragraph.first_line_indent = 0
+        # Не сбрасываем left_indent и first_line_indent, чтобы сохранить отступы списка
 
     def _setup_text_frame(self, shape, align=None, is_title=False):
         tf = shape.text_frame
@@ -156,12 +230,13 @@ class PptxCreator:
                     max_size = max(max_size, run.font.size.pt)
 
             if not text:
-                total_pt += max_size
+                # Если это не технический микро-абзац под картинку (max_size=1), учитываем высоту
+                if max_size > 1.0:
+                    total_pt += max_size * 0.8
             else:
-                # Оценка длины строки (около 65 символов для размера 22 на слайде 16:9)
                 chars_per_line = max(40, int(1400 / max_size))
                 lines = (len(text) // chars_per_line) + 1
-                total_pt += lines * max_size * self.line_spacing * 1.15  # 1.15 - интерлиньяж pptx
+                total_pt += lines * max_size * self.line_spacing * 1.15
 
             if p.space_after:
                 total_pt += p.space_after.pt
@@ -169,12 +244,15 @@ class PptxCreator:
         return total_pt / 72.0
 
     # ---------------------- ВСТАВКА ИЗОБРАЖЕНИЙ И ТАБЛИЦ -----
-    def _insert_image_shape(self, slide, text_frame, img_path):
+    def _insert_image_shape(self, slide, text_frame, img_path, level=0, is_block=True, text_offset_inches=0):
         if not os.path.exists(img_path):
-            return
+            return None
 
         current_text_h = self._get_current_tf_height(text_frame)
-        top_inch = text_frame._parent.top.inches + current_text_h + 0.05  # 0.05 дюйма отступ
+
+        # Если инлайн, поднимаем формулу по оси Y, чтобы она вписалась в уровень строки
+        offset_inch = 0.05 if is_block else -0.15
+        top_inch = text_frame._parent.top.inches + current_text_h + offset_inch
 
         pic = slide.shapes.add_picture(img_path, Inches(0), Inches(top_inch))
 
@@ -184,15 +262,24 @@ class PptxCreator:
             pic.width = int(max_width)
             pic.height = int(pic.height * ratio)
 
-        pic.left = int((self.prs.slide_width - pic.width) / 2)
+        if is_block and level == 0:
+            # Центрируем только независимые блоки
+            pic.left = int((self.prs.slide_width - pic.width) / 2)
+        else:
+            # Сдвигаем влево с учетом уровня списка и текста до формулы
+            base_left = text_frame._parent.left
+            indent_margin = Inches(0.4 * level + 0.1)
+            pic.left = base_left + indent_margin + Inches(text_offset_inches)
 
-        # Создаем прозрачный микро-абзац, отступ которого равен высоте картинки!
-        p = text_frame.add_paragraph()
-        self._remove_bullet_xml(p)
-        p.text = " "
-        p.font.size = Pt(1)
-        # Отступ равен высоте картинки + 10 пунктов для эстетичного зазора
-        p.space_before = Pt(pic.height.pt + 10)
+        if is_block:
+            # Создаем пустую техническую строку только для блочных элементов
+            p = text_frame.add_paragraph()
+            self._remove_bullet_xml(p)
+            p.text = " "
+            p.font.size = Pt(1)
+            p.space_before = Pt(pic.height.pt + 10)
+
+        return pic
 
     def _add_table(self, slide, text_frame, node):
         rows_nodes = node.children
@@ -281,19 +368,29 @@ class PptxCreator:
             p.level = min(level, 8)
             self._apply_paragraph_style(p, align=default_align)
 
-            for child in getattr(node, 'children', []):
-                # Если встретили формулу/картинку (инлайн или блочную)
+            children = getattr(node, 'children', [])
+            is_block = len(children) == 1
+
+            for child in children:
                 if child.__class__.__name__ == 'Image':
                     if slide:
-                        self._insert_image_shape(slide, text_frame, child.dest)
+                        # Оцениваем ширину уже написанного текста, чтобы сдвинуть картинку вправо (инлайн)
+                        text_before = "".join(r.text for r in p.runs)
+                        text_offset = len(text_before) * 0.13  # примерно 0.13 дюйма на символ
 
-                    # Начинаем новую строку для текста ПОСЛЕ формулы, НО отключаем маркер списка
-                    p = text_frame.add_paragraph()
-                    p.level = min(level, 8)
-                    self._remove_bullet_xml(p)
-                    self._apply_paragraph_style(p, align=default_align)
+                        pic = self._insert_image_shape(
+                            slide, text_frame, child.dest,
+                            level=p.level, is_block=is_block, text_offset_inches=text_offset
+                        )
+
+                        if not is_block and pic:
+                            # Хак: резервируем место прямо в текущей строке с помощью пробелов,
+                            # чтобы текст продолжился после картинки и не сломал списки
+                            run = p.add_run()
+                            space_count = max(1, int(pic.width.inches * 14))  # ~14 пробелов на 1 дюйм
+                            run.text = " " * space_count
                 else:
-                    self._fill_run(p, DummyNode([child]))
+                    self._fill_run(p, child)
 
         elif ntype == 'List':
             for item in node.children:
@@ -314,39 +411,65 @@ class PptxCreator:
             if slide:
                 self._add_table(slide, text_frame, node)
 
-    def _fill_run(self, paragraph, node, is_title=False):
-        if not hasattr(node, 'children'):
+    def _fill_run(self, paragraph, node, is_title=False, bold=False, italic=False):
+        """Рекурсивно обходит AST и добавляет текст с накопленными стилями."""
+        if node is None:
             return
-        for child in node.children:
-            ctype = child.__class__.__name__
-            if isinstance(child, str):
-                self._create_run(paragraph, child, is_title)
-            elif ctype == 'RawText':
-                self._create_run(paragraph, child.children, is_title)
-            elif ctype == 'Strong':
-                start_run = len(paragraph.runs)
-                self._fill_run(paragraph, child, is_title)
-                for i in range(start_run, len(paragraph.runs)):
-                    paragraph.runs[i].font.bold = True
-            elif ctype == 'Emphasis':
-                start_run = len(paragraph.runs)
-                self._fill_run(paragraph, child, is_title)
-                for i in range(start_run, len(paragraph.runs)):
-                    paragraph.runs[i].font.italic = True
-            elif ctype == 'CodeSpan':
-                self._create_run(paragraph, child.children, is_title, is_code=True)
-            elif hasattr(child, 'children'):
-                self._fill_run(paragraph, child, is_title)
+
+        ntype = node.__class__.__name__
+
+        # ИСПРАВЛЕНИЕ: marko использует имя StrongEmphasis для жирного шрифта
+        current_bold = bold or (ntype in ['Strong', 'StrongEmphasis'])
+        current_italic = italic or (ntype == 'Emphasis')
+        is_code = (ntype == 'CodeSpan')
+
+        # 1) Узел — обычная строка (например, при прямом вызове)
+        if isinstance(node, str):
+            self._create_run(paragraph, node, is_title, current_bold, current_italic, is_code)
+            return
+
+        # 2) Сырой текст (`RawText`)
+        if ntype == 'RawText':
+            self._create_run(paragraph, node.children, is_title, current_bold, current_italic, is_code)
+            return
+
+        # 3) Узел имеет атрибут `children` (список дочерних узлов)
+        if hasattr(node, 'children'):
+            children = node.children
+            # Защита: иногда `children` может быть строкой
+            if isinstance(children, str):
+                self._create_run(paragraph, children, is_title, current_bold, current_italic, is_code)
+                return
+            # Рекурсивно обрабатываем всех детей
+            for child in children:
+                self._fill_run(paragraph, child, is_title, current_bold, current_italic)
+            return
+
+        # 4) Узел имеет атрибут `text` (например, `LineBreak`)
+        if hasattr(node, 'text'):
+            self._create_run(paragraph, node.text, is_title, current_bold, current_italic, is_code)
+            return
+
+        # 5) Запасной вариант — просто преобразуем узел в строку
+        text = str(node)
+        if text:
+            self._create_run(paragraph, text, is_title, current_bold, current_italic, is_code)
 
     def _create_run(self, paragraph, text, is_title, bold=False, italic=False, is_code=False):
-        if not text or not str(text).strip():
+        """Создаёт Run и применяет накопленные свойства."""
+        if text is None or not str(text):
             return
+
         run = paragraph.add_run()
         run.text = str(text)
+
+        # Шрифт и размер
         run.font.name = self.code_font if is_code else self.font_name
         size = self.code_size if is_code else (self.title_size if is_title else self.body_size)
         run.font.size = Pt(size)
-        run.font.bold = bold
+
+        # Жирность и курсив
+        run.font.bold = bold or is_title  # для заголовков жирный всегда включён
         run.font.italic = italic
 
     # ---------------------- СОЗДАНИЕ СЛАЙДОВ -----------------
