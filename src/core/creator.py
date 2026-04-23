@@ -71,7 +71,6 @@ class PptxCreator:
         self.code_size = int(os.getenv("PPT_CODE_SIZE", "20"))
         self.line_spacing = float(os.getenv("PPT_LINE_SPACING", "1.0"))
 
-        # Новые настройки из .env
         self.tittle_margin_cm = float(os.getenv("PPT_TITTLE_MARGIN_CM", "0.0"))
         self.body_margin_cm = float(os.getenv("PPT_BODY_MARGIN_CM", "0.0"))
         self.title_bg_color = os.getenv("PPT_TITLE_BG_COLOR", "")
@@ -83,14 +82,10 @@ class PptxCreator:
         self.formula_numbering = os.getenv("PPT_FORMULA_NUMBERING", "false").lower() == "true"
         self.bullet_spacing = float(os.getenv("PPT_BULLET_SPACING", "12.0"))
 
-        # Настройки для нижнего колонтитула и нумерации
         self.footer_font_size = int(os.getenv("PPT_FOOTER_FONT_SIZE", "12"))
         self.numbering_font_size = int(os.getenv("PPT_NUMBERING_FONT_SIZE", "14"))
         self.numbering_width_cm = float(os.getenv("PPT_NUMBERING_WIDTH_CM", "2.0"))
 
-        self.formula_counter = 0
-
-        # Загрузка новых параметров из env
         self.layout_title_idx = int(os.getenv("PPT_LAYOUT_TITLE_IDX", "0"))
         self.layout_content_idx = int(os.getenv("PPT_LAYOUT_CONTENT_IDX", "1"))
         self.content_bottom_buffer = float(os.getenv("PPT_CONTENT_BOTTOM_BUFFER_INCH", "1.2"))
@@ -101,9 +96,14 @@ class PptxCreator:
         self.table_row_h = float(os.getenv("PPT_TABLE_ROW_HEIGHT_CM", "1.0"))
         self.footer_border_color = os.getenv("PPT_FOOTER_BORDER_COLOR", "38,70,115")
 
+        self.text_left_indent = float(os.getenv("PPT_TEXT_LEFT_INDENT_CM", "0.0"))
+        self.text_first_line_indent = float(os.getenv("PPT_TEXT_FIRST_LINE_INDENT_CM", "0.0"))
+
         self._set_aspect_ratio(os.getenv("PPT_ASPECT_RATIO", "16:9"))
         self.title_layout = self.prs.slide_layouts[self.layout_title_idx]
         self.content_layout = self.prs.slide_layouts[self.layout_content_idx]
+
+        self.formula_counter = 0
 
         self.warnings = []
         self.temp_files = []
@@ -225,18 +225,26 @@ class PptxCreator:
         if is_list_item:
             paragraph.space_after = Pt(self.bullet_spacing)
         else:
+            paragraph.level = 0
             self._remove_bullet_xml(paragraph)
 
     def _remove_bullet_xml(self, paragraph):
-        """Удаляет маркер списка, но сохраняет отступы (level)."""
+        """Удаляет маркер и жестко фиксирует отступы в XML, перекрывая шаблон PowerPoint."""
         pPr = paragraph._p.get_or_add_pPr()
-        # Удаляем элемент маркера (a:buNone)
-        for elem in pPr:
-            if elem.tag.endswith('buNone'):
-                pPr.remove(elem)
-                break
+
+        for elem in pPr.findall('.//{http://schemas.openxmlformats.org/drawingml/2006/main}buNone') + \
+                    pPr.findall('.//{http://schemas.openxmlformats.org/drawingml/2006/main}buChar') + \
+                    pPr.findall('.//{http://schemas.openxmlformats.org/drawingml/2006/main}buAutoNum'):
+            pPr.remove(elem)
+
         pPr.insert(0, OxmlElement('a:buNone'))
-        # Не сбрасываем left_indent и first_line_indent, чтобы сохранить отступы списка
+
+        left_margin_emu = int(Cm(self.text_left_indent).emu)
+
+        relative_indent_emu = int(Cm(self.text_first_line_indent - self.text_left_indent).emu)
+
+        pPr.set('marL', str(left_margin_emu))
+        pPr.set('indent', str(relative_indent_emu))
 
     def _setup_text_frame(self, shape, align=None, is_title=False):
         tf = shape.text_frame
@@ -283,7 +291,6 @@ class PptxCreator:
                     max_size = max(max_size, run.font.size.pt)
 
             if not text:
-                # Если это не технический микро-абзац под картинку (max_size=1), учитываем высоту
                 if max_size > 1.0:
                     total_pt += max_size * 0.8
             else:
@@ -718,12 +725,16 @@ class PptxCreator:
                             p.font.name = self.font_name
 
         self.prs.save(output_path)
+
+        self.prs = None
+
         for f in self.temp_files:
             if os.path.exists(f):
                 try:
                     os.remove(f)
-                except:
-                    pass
+                except Exception as e:
+                    self.warnings.append(f"Не удалось удалить временный файл {f}: {e}")
+
         return {"slides_created": total_slides, "warnings": self.warnings}
 
     def create_from_file(self, md_path, output_path):
