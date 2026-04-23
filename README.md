@@ -17,8 +17,11 @@
 
 | Входной Markdown | Результат в PPTX |
 | :--- | :--- |
-| ![Markdown Example](https://via.placeholder.com/400x250?text=Markdown+Source+Screenshot) | ![PPTX Result](https://via.placeholder.com/400x250?text=Generated+Slide+Screenshot) |
-| *Пример разметки с текстом и кодом* | *Готовый слайд с форматированием* |
+| ![Markdown Example](https://github.com/user-attachments/assets/1b11e5f8-6b98-4cca-9c88-47b5f0b6c0b2) | ![PPTX Result](https://github.com/user-attachments/assets/712861b6-2f64-420d-aba8-92c5d1b38a69) |
+| ![Markdown Example](https://github.com/user-attachments/assets/2599cc77-d390-42e6-9190-596dd29b0ace) | ![PPTX Result](https://github.com/user-attachments/assets/1b262913-697d-49d6-a02e-87d1d99c154c) |
+| ![Markdown Example](https://github.com/user-attachments/assets/ee68f5d9-25b9-4b7a-b484-c4fb752dae35) | ![PPTX Result](https://github.com/user-attachments/assets/f89ab59c-e9c2-45ae-84b5-6079250e8411) |
+| ![Markdown Example](https://github.com/user-attachments/assets/f6d08854-d55b-4fe4-b71e-2d59774108a5) | ![PPTX Result](https://github.com/user-attachments/assets/79b381bf-b01b-410a-848e-051b4feb1300) |
+| ![Markdown Example](https://github.com/user-attachments/assets/54faed4c-941b-4b0b-a242-755501fc96db) | ![PPTX Result](https://github.com/user-attachments/assets/b0ba4cf2-239b-42b9-913f-776aa72c8b10) |
 
 ---
 
