@@ -6,7 +6,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from pptx import Presentation
-from pptx.util import Pt, Inches
+from pptx.util import Pt, Inches, Cm
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
 from pptx.dml.color import RGBColor
 from pptx.oxml.xmlchemy import OxmlElement
@@ -70,12 +70,54 @@ class PptxCreator:
         self.code_font = os.getenv("PPT_CODE_FONT", "Courier New")
         self.code_size = int(os.getenv("PPT_CODE_SIZE", "20"))
         self.line_spacing = float(os.getenv("PPT_LINE_SPACING", "1.0"))
+
+        # Новые настройки из .env
+        self.tittle_margin_cm = float(os.getenv("PPT_TITTLE_MARGIN_CM", "0.0"))
+        self.body_margin_cm = float(os.getenv("PPT_BODY_MARGIN_CM", "0.0"))
+        self.title_bg_color = os.getenv("PPT_TITLE_BG_COLOR", "")
+        self.title_font_color = os.getenv("PPT_TITLE_FONT_COLOR", "0,0,0")
+        self.title_height_cm = float(os.getenv("PPT_TITLE_HEIGHT_CM", "1.5"))
+        self.slide_numbering = os.getenv("PPT_SLIDE_NUMBERING", "false").lower() == "true"
+        self.footer_text = os.getenv("PPT_FOOTER_TEXT", "")
+        self.footer_height_cm = float(os.getenv("PPT_FOOTER_HEIGHT_CM", "1.0"))
+        self.formula_numbering = os.getenv("PPT_FORMULA_NUMBERING", "false").lower() == "true"
+        self.bullet_spacing = float(os.getenv("PPT_BULLET_SPACING", "12.0"))
+
+        # Настройки для нижнего колонтитула и нумерации
+        self.footer_font_size = int(os.getenv("PPT_FOOTER_FONT_SIZE", "12"))
+        self.numbering_font_size = int(os.getenv("PPT_NUMBERING_FONT_SIZE", "14"))
+        self.numbering_width_cm = float(os.getenv("PPT_NUMBERING_WIDTH_CM", "2.0"))
+
+        self.formula_counter = 0
+
+        # Загрузка новых параметров из env
+        self.layout_title_idx = int(os.getenv("PPT_LAYOUT_TITLE_IDX", "0"))
+        self.layout_content_idx = int(os.getenv("PPT_LAYOUT_CONTENT_IDX", "1"))
+        self.content_bottom_buffer = float(os.getenv("PPT_CONTENT_BOTTOM_BUFFER_INCH", "1.2"))
+        self.ts_title_top = float(os.getenv("PPT_TITLE_SLIDE_TITLE_TOP_INCH", "2.0"))
+        self.ts_subtitle_top = float(os.getenv("PPT_TITLE_SLIDE_SUBTITLE_TOP_INCH", "4.0"))
+        self.tf_padding = float(os.getenv("PPT_TEXT_FRAME_PADDING_CM", "0.13"))
+        self.img_width_ratio = float(os.getenv("PPT_IMAGE_WIDTH_RATIO", "0.9"))
+        self.table_row_h = float(os.getenv("PPT_TABLE_ROW_HEIGHT_CM", "1.0"))
+        self.footer_border_color = os.getenv("PPT_FOOTER_BORDER_COLOR", "38,70,115")
+
         self._set_aspect_ratio(os.getenv("PPT_ASPECT_RATIO", "16:9"))
-        self.title_layout = self.prs.slide_layouts[0]
-        self.content_layout = self.prs.slide_layouts[1]
+        self.title_layout = self.prs.slide_layouts[self.layout_title_idx]
+        self.content_layout = self.prs.slide_layouts[self.layout_content_idx]
+
         self.warnings = []
         self.temp_files = []
         self.md_parser = marko.Markdown(extensions=['gfm'])
+
+    def _parse_color(self, color_str, default_rgb=(0, 0, 0)):
+        """Парсит цвет 'R,G,B' из строки."""
+        if not color_str:
+            return RGBColor(*default_rgb)
+        try:
+            parts = [int(x.strip()) for x in color_str.split(',')]
+            return RGBColor(parts[0], parts[1], parts[2])
+        except Exception:
+            return RGBColor(*default_rgb)
 
     def _set_aspect_ratio(self, ratio_str):
         ratios = {"4:3": (9144000, 6858000), "16:9": (12192000, 6858000)}
@@ -175,11 +217,14 @@ class PptxCreator:
         return text
 
     # ---------------------- ВСПОМОГАТЕЛЬНЫЕ -----------------
-    def _apply_paragraph_style(self, paragraph, is_code=False, align=None):
+    def _apply_paragraph_style(self, paragraph, is_code=False, align=None, is_list_item=False):
         if align:
             paragraph.alignment = align
         paragraph.line_spacing = self.line_spacing
-        if is_code:
+
+        if is_list_item:
+            paragraph.space_after = Pt(self.bullet_spacing)
+        else:
             self._remove_bullet_xml(paragraph)
 
     def _remove_bullet_xml(self, paragraph):
@@ -196,18 +241,26 @@ class PptxCreator:
     def _setup_text_frame(self, shape, align=None, is_title=False):
         tf = shape.text_frame
         tf.word_wrap = True
-        tf.auto_size = MSO_AUTO_SIZE.SHAPE_TO_FIT_TEXT
+        tf.auto_size = MSO_AUTO_SIZE.SHAPE_TO_FIT_TEXT if is_title else MSO_AUTO_SIZE.NONE
         tf.vertical_anchor = MSO_ANCHOR.MIDDLE if is_title else MSO_ANCHOR.TOP
+
+        tf.margin_left = Cm(self.tittle_margin_cm) if is_title else Cm(self.body_margin_cm)
+        tf.margin_right = Cm(self.tittle_margin_cm) if is_title else Cm(self.body_margin_cm)
+        tf.margin_top = Cm(self.tf_padding)
+        tf.margin_bottom = Cm(self.tf_padding)
+
         tf.clear()
         return tf
 
-    def _position_shape(self, shape, top_inch, height_inch=None, width_percent=0.9):
+    def _position_shape(self, shape, top_inch, height_inch=None):
+        # Ширина теперь: Ширина слайда минус (отступ * 2)
         slide_width = self.prs.slide_width
-        new_width = int(slide_width * width_percent)
+        new_width = slide_width - Cm(self.tittle_margin_cm * 2)
         shape.width = new_width
         if height_inch:
             shape.height = Inches(height_inch)
-        shape.left = int((slide_width - new_width) / 2)
+
+        shape.left = Cm(self.tittle_margin_cm)
         shape.top = Inches(top_inch)
         return shape
 
@@ -249,30 +302,40 @@ class PptxCreator:
             return None
 
         current_text_h = self._get_current_tf_height(text_frame)
-
-        # Если инлайн, поднимаем формулу по оси Y, чтобы она вписалась в уровень строки
         offset_inch = 0.05 if is_block else -0.15
         top_inch = text_frame._parent.top.inches + current_text_h + offset_inch
 
         pic = slide.shapes.add_picture(img_path, Inches(0), Inches(top_inch))
 
-        max_width = self.prs.slide_width * 0.9
+        max_width = (self.prs.slide_width - Cm(self.tittle_margin_cm * 2)) * self.img_width_ratio
         if pic.width > max_width:
             ratio = max_width / pic.width
             pic.width = int(max_width)
             pic.height = int(pic.height * ratio)
 
         if is_block and level == 0:
-            # Центрируем только независимые блоки
             pic.left = int((self.prs.slide_width - pic.width) / 2)
         else:
-            # Сдвигаем влево с учетом уровня списка и текста до формулы
             base_left = text_frame._parent.left
             indent_margin = Inches(0.4 * level + 0.1)
             pic.left = base_left + indent_margin + Inches(text_offset_inches)
 
+        # Нумерация блочных формул
+        is_math = "math_" in img_path
+        if is_block and is_math and self.formula_numbering:
+            self.formula_counter += 1
+            num_w = Cm(2)
+            num_l = self.prs.slide_width - Cm(self.tittle_margin_cm) - num_w
+            num_shape = slide.shapes.add_textbox(num_l, Inches(top_inch), num_w, pic.height)
+            tf = num_shape.text_frame
+            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            p = tf.paragraphs[0]
+            p.alignment = PP_ALIGN.RIGHT
+            p.text = f"({self.formula_counter})"
+            p.font.size = Pt(self.body_size)
+            p.font.name = self.font_name
+
         if is_block:
-            # Создаем пустую техническую строку только для блочных элементов
             p = text_frame.add_paragraph()
             self._remove_bullet_xml(p)
             p.text = " "
@@ -291,10 +354,10 @@ class PptxCreator:
         current_text_h = self._get_current_tf_height(text_frame)
         top_inch = text_frame._parent.top.inches + current_text_h + 0.1
 
-        width = int(self.prs.slide_width * 0.9)
+        width = int(self.prs.slide_width * self.img_width_ratio)
         left = int((self.prs.slide_width - width) / 2)
-        row_height = 0.4
-        tbl_shape = slide.shapes.add_table(rows, cols, left, Inches(top_inch), width, Inches(row_height * rows))
+        row_height_cm = self.table_row_h
+        tbl_shape = slide.shapes.add_table(rows, cols, left, Inches(top_inch), width, Cm(row_height_cm * rows))
         table = tbl_shape.table
 
         for r_idx, row_node in enumerate(rows_nodes):
@@ -360,13 +423,13 @@ class PptxCreator:
                 run.font.color.rgb = color
 
     # ---------------------- ОБХОД AST ------------------------
-    def _add_node_to_frame(self, text_frame, node, slide=None, level=0, default_align=None):
+    def _add_node_to_frame(self, text_frame, node, slide=None, level=0, default_align=None, is_list_item=False):
         ntype = node.__class__.__name__
 
         if ntype == 'Paragraph':
             p = self._get_or_add_paragraph(text_frame)
             p.level = min(level, 8)
-            self._apply_paragraph_style(p, align=default_align)
+            self._apply_paragraph_style(p, align=default_align, is_list_item=is_list_item)
 
             children = getattr(node, 'children', [])
             is_block = len(children) == 1
@@ -374,9 +437,8 @@ class PptxCreator:
             for child in children:
                 if child.__class__.__name__ == 'Image':
                     if slide:
-                        # Оцениваем ширину уже написанного текста, чтобы сдвинуть картинку вправо (инлайн)
                         text_before = "".join(r.text for r in p.runs)
-                        text_offset = len(text_before) * 0.13  # примерно 0.13 дюйма на символ
+                        text_offset = len(text_before) * 0.13
 
                         pic = self._insert_image_shape(
                             slide, text_frame, child.dest,
@@ -384,10 +446,8 @@ class PptxCreator:
                         )
 
                         if not is_block and pic:
-                            # Хак: резервируем место прямо в текущей строке с помощью пробелов,
-                            # чтобы текст продолжился после картинки и не сломал списки
                             run = p.add_run()
-                            space_count = max(1, int(pic.width.inches * 14))  # ~14 пробелов на 1 дюйм
+                            space_count = max(1, int(pic.width.inches * 14))
                             run.text = " " * space_count
                 else:
                     self._fill_run(p, child)
@@ -400,7 +460,7 @@ class PptxCreator:
                             self._add_node_to_frame(text_frame, sub, slide=slide, level=level + 1)
                         else:
                             self._add_node_to_frame(text_frame, sub, slide=slide, level=level,
-                                                    default_align=default_align)
+                                                    default_align=default_align, is_list_item=True)
 
         elif ntype in ['FencedCode', 'CodeBlock']:
             lang = getattr(node, 'lang', 'text')
@@ -468,12 +528,104 @@ class PptxCreator:
         size = self.code_size if is_code else (self.title_size if is_title else self.body_size)
         run.font.size = Pt(size)
 
+        if is_title:
+            run.font.color.rgb = self._parse_color(self.title_font_color, (0, 0, 0))
+
         # Жирность и курсив
-        run.font.bold = bold or is_title  # для заголовков жирный всегда включён
+        run.font.bold = bold or is_title
         run.font.italic = italic
 
     # ---------------------- СОЗДАНИЕ СЛАЙДОВ -----------------
-    def _create_title_slide(self, doc):
+    def _add_footer_and_numbering(self, slide, slide_idx):
+        """Отрисовывает нижний колонтитул и номер слайда по макету."""
+        slide_w = self.prs.slide_width
+        slide_h = self.prs.slide_height
+        margin = Cm(self.tittle_margin_cm)
+        footer_h = Cm(self.footer_height_cm)
+
+        bottom_y = slide_h - footer_h
+
+        border_color = self._parse_color(self.footer_border_color, (38, 70, 115))
+
+        num_w = Cm(self.numbering_width_cm) if self.slide_numbering else 0
+
+        if self.footer_text:
+            # Ширина футера точно рассчитывается, чтобы оставить место под номер
+            footer_w = slide_w - margin * 2 - num_w
+
+            f_shape = slide.shapes.add_textbox(margin, bottom_y, footer_w, footer_h)
+            f_shape.line.color.rgb = border_color
+            f_shape.line.width = Pt(1)
+            tf = f_shape.text_frame
+            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            p = tf.paragraphs[0]
+            p.text = self.footer_text
+            p.alignment = PP_ALIGN.CENTER
+            p.font.size = Pt(self.footer_font_size)
+            p.font.name = self.font_name
+
+        if self.slide_numbering:
+            # Левая координата стыкуется ровно с правым краем футера
+            num_l = margin + footer_w if self.footer_text else slide_w - margin - num_w
+
+            n_shape = slide.shapes.add_textbox(num_l, bottom_y, num_w, footer_h)
+            n_shape.name = "SlideNumberBox"  # Добавляем имя, чтобы легко найти на втором проходе
+            n_shape.line.color.rgb = border_color
+            n_shape.line.width = Pt(1)
+            tf = n_shape.text_frame
+            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            p = tf.paragraphs[0]
+            p.text = str(slide_idx)  # Временно пишем только номер
+            p.alignment = PP_ALIGN.CENTER
+            p.font.size = Pt(self.numbering_font_size)
+            p.font.bold = True
+            p.font.name = self.font_name
+
+    def _init_content_slide(self, title_node, slide_idx, is_continuation=False):
+        """Инициализирует новый контентный слайд с правильными стилями и фонами."""
+        slide = self.prs.slides.add_slide(self.content_layout)
+
+        if slide.shapes.title and title_node:
+            shape = self._position_shape(slide.shapes.title, top_inch=Cm(self.tittle_margin_cm).inches,
+                                         height_inch=Cm(self.title_height_cm).inches)
+
+            # Применение фона заголовка
+            if self.title_bg_color:
+                fill = shape.fill
+                fill.solid()
+                fill.fore_color.rgb = self._parse_color(self.title_bg_color, (255, 255, 255))
+
+            tf = self._setup_text_frame(shape, align=PP_ALIGN.CENTER, is_title=True)
+            p = tf.paragraphs[0]
+            self._apply_paragraph_style(p, align=PP_ALIGN.CENTER)
+
+            # Если это перенос, добавляем (продолжение)
+            if is_continuation:
+                copied_node = deepcopy(title_node)
+                if hasattr(copied_node.children[0], 'children'):
+                    copied_node.children[0].children += " (продолжение)"
+                self._fill_run(p, copied_node, is_title=True)
+            else:
+                self._fill_run(p, title_node, is_title=True)
+
+        self._add_footer_and_numbering(slide, slide_idx)
+
+        # Вычисляем стартовую позицию для текста (отступ сверху от заголовка)
+        top_offset_inch = Cm(self.tittle_margin_cm + self.title_height_cm).inches
+        tf = None
+        if len(slide.placeholders) > 1:
+            # ВАЖНО: Считаем доступную высоту для блока текста
+            footer_h_inch = Cm(self.footer_height_cm).inches if (self.footer_text or self.slide_numbering) else Cm(
+                self.tittle_margin_cm).inches
+            content_h_inch = self.prs.slide_height.inches - top_offset_inch - footer_h_inch - Cm(self.tittle_margin_cm).inches
+
+            # Теперь передаем height_inch в _position_shape
+            shape = self._position_shape(slide.placeholders[1], top_inch=top_offset_inch, height_inch=content_h_inch)
+            tf = self._setup_text_frame(shape, align=PP_ALIGN.LEFT, is_title=False)
+
+        return slide, tf
+
+    def _create_title_slide(self, doc, slide_num):
         slide = self.prs.slides.add_slide(self.title_layout)
         title_node, other_nodes = None, []
         for node in doc.children:
@@ -483,58 +635,87 @@ class PptxCreator:
                 other_nodes.append(node)
 
         if slide.shapes.title and title_node:
-            shape = self._position_shape(slide.shapes.title, top_inch=2.0, height_inch=1.5)
+            shape = self._position_shape(slide.shapes.title, top_inch=self.ts_title_top, height_inch=Cm(self.title_height_cm).inches)
+            if self.title_bg_color:
+                fill = shape.fill
+                fill.solid()
+                fill.fore_color.rgb = self._parse_color(self.title_bg_color, (255, 255, 255))
+
             tf = self._setup_text_frame(shape, align=PP_ALIGN.CENTER, is_title=True)
             p = tf.paragraphs[0]
             self._apply_paragraph_style(p, align=PP_ALIGN.CENTER)
             self._fill_run(p, title_node, is_title=True)
 
         if len(slide.placeholders) > 1:
-            shape = self._position_shape(slide.placeholders[1], top_inch=4.0, height_inch=2.5)
+            shape = self._position_shape(slide.placeholders[1], top_inch=self.ts_subtitle_top, height_inch=2.5)
             tf = self._setup_text_frame(shape, align=PP_ALIGN.CENTER)
             for node in other_nodes:
                 self._add_node_to_frame(tf, node, slide=slide, default_align=PP_ALIGN.CENTER)
 
-    def _create_content_slide(self, doc, slide_num):
-        slide = self.prs.slides.add_slide(self.content_layout)
-        title_node = None
-        for node in doc.children:
-            if node.__class__.__name__ == 'Heading':
-                title_node = node
-                break
+        self._add_footer_and_numbering(slide, slide_num)
 
-        if slide.shapes.title and title_node:
-            shape = self._position_shape(slide.shapes.title, top_inch=0.4, height_inch=1.0)
-            tf = self._setup_text_frame(shape, align=PP_ALIGN.CENTER, is_title=True)
-            p = tf.paragraphs[0]
-            self._apply_paragraph_style(p, align=PP_ALIGN.CENTER)
-            self._fill_run(p, title_node, is_title=True)
+    def _create_content_slide(self, doc, start_slide_idx):
+        title_node = next((n for n in doc.children if n.__class__.__name__ == 'Heading'), None)
+        nodes_to_process = [n for n in doc.children if n is not title_node]
 
-        if len(slide.placeholders) > 1:
-            shape = self._position_shape(slide.placeholders[1], top_inch=1.6, height_inch=5.0)
-            tf = self._setup_text_frame(shape, align=PP_ALIGN.LEFT)
-            for node in doc.children:
-                if node is title_node:
-                    continue
+        slide_idx = start_slide_idx
+        slide, tf = self._init_content_slide(title_node, slide_idx)
+
+        # Вычисляем доступную высоту (Auto-splitting logic)
+        footer_h = Cm(self.footer_height_cm).inches if self.footer_text or self.slide_numbering else 0
+        title_h = Cm(self.title_height_cm + self.tittle_margin_cm).inches
+        # Оставляем ~1.2 дюйма буфера снизу, чтобы текст не наезжал на колонтитул
+        max_h_inches = self.prs.slide_height.inches - title_h - footer_h - self.content_bottom_buffer
+
+        for node in nodes_to_process:
+            # Проверяем высоту перед вставкой (защита от переполнения)
+            if tf and self._get_current_tf_height(tf) > max_h_inches and len(tf.paragraphs) > 1:
+                slide_idx += 1
+                slide, tf = self._init_content_slide(title_node, slide_idx, is_continuation=True)
+
+            if tf:
                 self._add_node_to_frame(tf, node, slide=slide)
+
+        return slide_idx
 
     # ---------------------- ТОЧКИ ВХОДА ----------------------
     def create_from_text(self, md_text, output_path):
         self.warnings = []
         self.temp_files = []
+        self.formula_counter = 0  # Сброс нумерации для нового файла
+
         md_text = self._process_math_blocks(md_text)
         blocks = re.split(r'\n\s*---\s*\n', md_text.strip())
         if not blocks or not blocks[0].strip():
             raise PptxSyntaxError("MD текст пуст.")
 
+        slide_num = 1
         for idx, block in enumerate(blocks):
             if not block.strip():
                 continue
             doc = self.md_parser.parse(block)
             if idx == 0:
-                self._create_title_slide(doc)
+                self._create_title_slide(doc, slide_num)
+                slide_num += 1
             else:
-                self._create_content_slide(doc, idx + 1)
+                slide_num = self._create_content_slide(doc, slide_num) + 1
+
+        # --- ВТОРОЙ ПРОХОД: Добавление общего количества слайдов ---
+        total_slides = len(self.prs.slides)
+        if self.slide_numbering:
+            for slide in self.prs.slides:
+                for shape in slide.shapes:
+                    if shape.name == "SlideNumberBox":
+                        tf = shape.text_frame
+                        if tf.paragraphs:
+                            p = tf.paragraphs[0]
+                            current_num = p.text
+                            p.text = f"{current_num}/{total_slides}"
+                            # Переназначаем стили, так как перезапись p.text их сбрасывает
+                            p.alignment = PP_ALIGN.CENTER
+                            p.font.size = Pt(self.numbering_font_size)
+                            p.font.bold = True
+                            p.font.name = self.font_name
 
         self.prs.save(output_path)
         for f in self.temp_files:
@@ -543,7 +724,7 @@ class PptxCreator:
                     os.remove(f)
                 except:
                     pass
-        return {"slides_created": len(self.prs.slides), "warnings": self.warnings}
+        return {"slides_created": total_slides, "warnings": self.warnings}
 
     def create_from_file(self, md_path, output_path):
         with open(md_path, 'r', encoding='utf-8') as f:
