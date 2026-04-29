@@ -389,7 +389,7 @@ class PptxCreator:
         p.space_before = Pt(tbl_shape.height.pt + 15)
 
     # ---------------------- ПОДСВЕТКА КОДА -------------------
-    def _add_highlighted_code(self, text_frame, code_text, lang='text'):
+    def _add_highlighted_code(self, text_frame, code_text, lang, slide, title_node, slide_idx):
         code_text = code_text.replace('\t', '    ').strip('\n\r')
         try:
             lexer = get_lexer_by_name(lang)
@@ -397,18 +397,30 @@ class PptxCreator:
             lexer = lexers.get_lexer_by_name('text')
 
         lines = code_text.split('\n')
-        for i, line in enumerate(lines):
-            p = self._get_or_add_paragraph(text_frame) if i == 0 else text_frame.add_paragraph()
+        for line in lines:
+            # Проверка высоты
+            footer_h = Cm(self.footer_height_cm).inches if (self.footer_text or self.slide_numbering) else 0
+            title_h = Cm(self.title_height_cm + self.tittle_margin_cm).inches
+            max_h = self.prs.slide_height.inches - title_h - footer_h - self.content_bottom_buffer
+
+            if self._get_current_tf_height(text_frame) > max_h:
+                slide_idx += 1
+                # Важно: здесь slide, tf = ...
+                slide, text_frame = self._init_content_slide(title_node, slide_idx, is_continuation=True)
+
+            p = self._get_or_add_paragraph(text_frame)
             self._apply_paragraph_style(p, is_code=True, align=PP_ALIGN.LEFT)
+
             tokens = lexer.get_tokens(line)
             for ttype, value in tokens:
                 val = value.replace('\r', '').replace('\n', '')
-                if not val:
-                    continue
+                if not val: continue
                 run = p.add_run()
                 run.text = val
                 run.font.name = self.code_font
                 run.font.size = Pt(self.code_size)
+
+                # Цвета
                 if ttype in Token.Keyword:
                     color = CODE_THEME['Keyword']
                 elif ttype in Token.Name.Function:
@@ -429,97 +441,110 @@ class PptxCreator:
                     color = CODE_THEME['Other']
                 run.font.color.rgb = color
 
+        return text_frame, slide, slide_idx
+
     # ---------------------- ОБХОД AST ------------------------
-    def _add_node_to_frame(self, text_frame, node, slide=None, level=0, default_align=None, is_list_item=False):
+    def _add_node_to_frame(self, text_frame, node, slide=None, level=0, default_align=None,
+                           is_list_item=False, is_quote=False, title_node=None, slide_idx=0):
         ntype = node.__class__.__name__
 
+        def check_overflow(current_tf, current_slide, current_idx):
+            footer_h = Cm(self.footer_height_cm).inches if (self.footer_text or self.slide_numbering) else 0
+            title_h = Cm(self.title_height_cm + self.tittle_margin_cm).inches
+            max_h = self.prs.slide_height.inches - title_h - footer_h - self.content_bottom_buffer
+
+            if self._get_current_tf_height(current_tf) > max_h:
+                new_idx = current_idx + 1
+                # _init_content_slide возвращает (slide, tf)
+                new_slide, new_tf = self._init_content_slide(title_node, new_idx, is_continuation=True)
+                return new_tf, new_slide, new_idx
+            return current_tf, current_slide, current_idx
+
         if ntype == 'Paragraph':
+            text_frame, slide, slide_idx = check_overflow(text_frame, slide, slide_idx)
             p = self._get_or_add_paragraph(text_frame)
             p.level = min(level, 8)
             self._apply_paragraph_style(p, align=default_align, is_list_item=is_list_item)
+            for child in getattr(node, 'children', []):
+                self._fill_run(p, child, italic=is_quote)
 
-            children = getattr(node, 'children', [])
-            is_block = len(children) == 1
-
-            for child in children:
-                if child.__class__.__name__ == 'Image':
-                    if slide:
-                        text_before = "".join(r.text for r in p.runs)
-                        text_offset = len(text_before) * 0.13
-
-                        pic = self._insert_image_shape(
-                            slide, text_frame, child.dest,
-                            level=p.level, is_block=is_block, text_offset_inches=text_offset
-                        )
-
-                        if not is_block and pic:
-                            run = p.add_run()
-                            space_count = max(1, int(pic.width.inches * 14))
-                            run.text = " " * space_count
-                else:
-                    self._fill_run(p, child)
+        elif ntype == 'Quote':
+            for child in node.children:
+                text_frame, slide, slide_idx = self._add_node_to_frame(
+                    text_frame, child, slide=slide, level=level,
+                    title_node=title_node, slide_idx=slide_idx, is_quote=True
+                )
 
         elif ntype == 'List':
             for item in node.children:
                 if item.__class__.__name__ == 'ListItem':
+                    text_frame, slide, slide_idx = check_overflow(text_frame, slide, slide_idx)
                     for sub in item.children:
                         if sub.__class__.__name__ == 'List':
-                            self._add_node_to_frame(text_frame, sub, slide=slide, level=level + 1)
+                            text_frame, slide, slide_idx = self._add_node_to_frame(
+                                text_frame, sub, slide=slide, level=level + 1,
+                                title_node=title_node, slide_idx=slide_idx, is_quote=is_quote
+                            )
                         else:
-                            self._add_node_to_frame(text_frame, sub, slide=slide, level=level,
-                                                    default_align=default_align, is_list_item=True)
+                            text_frame, slide, slide_idx = self._add_node_to_frame(
+                                text_frame, sub, slide=slide, level=level,
+                                default_align=default_align, is_list_item=True,
+                                title_node=title_node, slide_idx=slide_idx, is_quote=is_quote
+                            )
 
         elif ntype in ['FencedCode', 'CodeBlock']:
             lang = getattr(node, 'lang', 'text')
             content = node.children[0].children if hasattr(node.children[0], 'children') else node.children[0]
-            self._add_highlighted_code(text_frame, str(content), lang)
+            text_frame, slide, slide_idx = self._add_highlighted_code(
+                text_frame, str(content), lang, slide, title_node, slide_idx
+            )
 
         elif ntype == 'Table':
-            if slide:
-                self._add_table(slide, text_frame, node)
+            text_frame, slide, slide_idx = check_overflow(text_frame, slide, slide_idx)
+            self._add_table(slide, text_frame, node)
+
+        return text_frame, slide, slide_idx
 
     def _fill_run(self, paragraph, node, is_title=False, bold=False, italic=False):
-        """Рекурсивно обходит AST и добавляет текст с накопленными стилями."""
         if node is None:
             return
 
         ntype = node.__class__.__name__
 
-        # ИСПРАВЛЕНИЕ: marko использует имя StrongEmphasis для жирного шрифта
+        # Определяем стили текущего узла
         current_bold = bold or (ntype in ['Strong', 'StrongEmphasis'])
-        current_italic = italic or (ntype == 'Emphasis')
+        current_italic = italic or (ntype in ['Emphasis', 'Italic'])
         is_code = (ntype == 'CodeSpan')
 
-        # 1) Узел — обычная строка (например, при прямом вызове)
+        # 1. Если это просто текст
         if isinstance(node, str):
             self._create_run(paragraph, node, is_title, current_bold, current_italic, is_code)
             return
 
-        # 2) Сырой текст (`RawText`)
+        # 2. Если это RawText (базовый текст marko)
         if ntype == 'RawText':
             self._create_run(paragraph, node.children, is_title, current_bold, current_italic, is_code)
             return
 
-        # 3) Узел имеет атрибут `children` (список дочерних узлов)
+        # 3. Если у узла есть дети (Link, Emphasis, Strong и т.д.)
         if hasattr(node, 'children'):
             children = node.children
-            # Защита: иногда `children` может быть строкой
             if isinstance(children, str):
                 self._create_run(paragraph, children, is_title, current_bold, current_italic, is_code)
-                return
-            # Рекурсивно обрабатываем всех детей
-            for child in children:
-                self._fill_run(paragraph, child, is_title, current_bold, current_italic)
+            else:
+                for child in children:
+                    # Рекурсивно вызываем с накопленными стилями
+                    self._fill_run(paragraph, child, is_title, current_bold, current_italic)
             return
 
-        # 4) Узел имеет атрибут `text` (например, `LineBreak`)
-        if hasattr(node, 'text'):
-            self._create_run(paragraph, node.text, is_title, current_bold, current_italic, is_code)
+        # 4. Обработка переносов строк
+        if ntype in ['LineBreak', 'SoftLineBreak']:
+            self._create_run(paragraph, " ", is_title, bold, italic)
             return
 
-        # 5) Запасной вариант — просто преобразуем узел в строку
+        # 5. Запасной вариант
         text = str(node)
-        if text:
+        if text and ntype != 'ListItem': # ListItem обрабатывается выше
             self._create_run(paragraph, text, is_title, current_bold, current_italic, is_code)
 
     def _create_run(self, paragraph, text, is_title, bold=False, italic=False, is_code=False):
@@ -606,14 +631,7 @@ class PptxCreator:
             p = tf.paragraphs[0]
             self._apply_paragraph_style(p, align=PP_ALIGN.CENTER)
 
-            # Если это перенос, добавляем (продолжение)
-            if is_continuation:
-                copied_node = deepcopy(title_node)
-                if hasattr(copied_node.children[0], 'children'):
-                    copied_node.children[0].children += " (продолжение)"
-                self._fill_run(p, copied_node, is_title=True)
-            else:
-                self._fill_run(p, title_node, is_title=True)
+            self._fill_run(p, title_node, is_title=True)
 
         self._add_footer_and_numbering(slide, slide_idx)
 
@@ -668,21 +686,11 @@ class PptxCreator:
         slide_idx = start_slide_idx
         slide, tf = self._init_content_slide(title_node, slide_idx)
 
-        # Вычисляем доступную высоту (Auto-splitting logic)
-        footer_h = Cm(self.footer_height_cm).inches if self.footer_text or self.slide_numbering else 0
-        title_h = Cm(self.title_height_cm + self.tittle_margin_cm).inches
-        # Оставляем ~1.2 дюйма буфера снизу, чтобы текст не наезжал на колонтитул
-        max_h_inches = self.prs.slide_height.inches - title_h - footer_h - self.content_bottom_buffer
-
         for node in nodes_to_process:
-            # Проверяем высоту перед вставкой (защита от переполнения)
-            if tf and self._get_current_tf_height(tf) > max_h_inches and len(tf.paragraphs) > 1:
-                slide_idx += 1
-                slide, tf = self._init_content_slide(title_node, slide_idx, is_continuation=True)
-
-            if tf:
-                self._add_node_to_frame(tf, node, slide=slide)
-
+            # ВАЖНО: Получаем tf, slide, slide_idx именно в таком порядке
+            tf, slide, slide_idx = self._add_node_to_frame(tf, node, slide=slide,
+                                                           title_node=title_node,
+                                                           slide_idx=slide_idx)
         return slide_idx
 
     # ---------------------- ТОЧКИ ВХОДА ----------------------

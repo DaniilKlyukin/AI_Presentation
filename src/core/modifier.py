@@ -17,6 +17,24 @@ class CompactPptxModifier:
         self.slide_height = self.prs.slide_height
         self.warnings = []  # Сборник некритичных проблем
 
+    def _get_style_map(self):
+        """Карта соответствия тегов свойствам font в python-pptx."""
+        return {
+            'b': lambda f, v: setattr(f, 'bold', v == '1'),
+            'i': lambda f, v: setattr(f, 'italic', v == '1'),
+            'u': lambda f, v: setattr(f, 'underline', v == '1'),
+            'sz': lambda f, v: setattr(f, 'size', Pt(int(v))),
+            'f': lambda f, v: setattr(f, 'name', v),
+            'c': lambda f, v: self._apply_color_to_font(f, v),
+        }
+
+    def _apply_color_to_font(self, font, color_val):
+        if color_val == '0':
+            font.color.rgb = None # Сброс цвета
+        else:
+            rgb = self._parse_color(color_val, "Inline", "Tag")
+            if rgb: font.color.rgb = rgb
+
     def _substitute_layout(self):
         for layout in self.prs.slide_layouts:
             name = layout.name.lower()
@@ -146,27 +164,35 @@ class CompactPptxModifier:
 
         for line in data_lines:
             line = line.strip()
-            if not line: continue
-            if line.startswith('G:'): continue
-            if re.match(r'^\(.*\)$', line): continue
+            if not line or line.startswith('G:') or re.match(r'^\(.*\)$', line):
+                continue
 
             if line.startswith('|'):
+                # ... (логика таблиц остается прежней)
                 if not re.match(r'^\|[-\s|]+\|$', line):
                     row_cells = [c.strip() for c in line.split('|')[1:-1]]
                     table_data.append(row_cells)
                 continue
 
             base_style = {}
+
+            if line.startswith('##'):
+                base_style.update({'sz': '24', 'b': '1', 'c': '#800000'})  # Стиль заголовка
+                line = line[2:].strip()
+            elif line.startswith('>'):
+                base_style.update({'i': '1'})  # Курсив для цитат
+                line = line[1:].strip()
+
             block_style_match = re.search(r'\[((?:lvl|sz|b|c|i)[^\]]*)\]', line)
             if block_style_match:
                 try:
-                    base_style = dict(item.split(':') for item in block_style_match.group(1).split(',') if ':' in item)
+                    base_style.update(
+                        dict(item.split(':') for item in block_style_match.group(1).split(',') if ':' in item))
                 except ValueError:
-                    raise PptxSyntaxError(
-                        f"Слайд {slide_ref}, Элемент {el_ref}: Неверный синтаксис базового стиля '{block_style_match.group(0)}'.")
+                    raise PptxSyntaxError(f"Слайд {slide_ref}: Ошибка в стиле '{block_style_match.group(0)}'.")
 
-            clean_text = re.sub(r'\[(?:lvl|sz|b|c|i)[^\]]*\]', '', line)
-            clean_text = re.sub(r'^-?\s*', '', clean_text).strip()
+            clean_text = re.sub(r'\[(lvl|G):[^\]]*\]', '', line).strip()
+            clean_text = re.sub(r'\*\*(.*?)\*\*', r'[b:1][c:#0433FF]\1[c:0][b:0]', clean_text)
 
             if clean_text:
                 paragraphs_data.append({'t': clean_text, 's': base_style})
@@ -188,41 +214,43 @@ class CompactPptxModifier:
 
     def _apply_inline_formatting(self, paragraph, text, base_style, slide_ref, el_ref):
         paragraph.text = ""
+        style_map = self._get_style_map()
 
+        # 1. Обработка уровня параграфа (lvl)
         if 'lvl' in base_style:
-            try:
-                paragraph.level = min(int(base_style['lvl']), 8)
-            except ValueError:
-                raise PptxSyntaxError(f"Слайд {slide_ref}, Элемент {el_ref}: Уровень 'lvl' должен быть числом.")
+            paragraph.level = min(int(base_style.get('lvl', 0)), 8)
 
-        base_sz = Pt(int(base_style['sz'])) if 'sz' in base_style and base_style['sz'].isdigit() else None
-        cur_b = base_style.get('b') == '1'
-        cur_i = False
-        cur_c = self._parse_color(base_style['c'], slide_ref, el_ref) if 'c' in base_style else None
+        # 2. Текущее состояние стилей (начинаем с базовых)
+        # Объединяем дефолты и то, что пришло в [lvl:1,sz:20]
+        current_state = {
+            'b': base_style.get('b'),
+            'i': base_style.get('i'),
+            'sz': base_style.get('sz'),
+            'c': base_style.get('c'),
+            'f': self.DEFAULT_FONT
+        }
 
-        parts = re.split(r'(\[[bic]:[a-zA-Z0-9#]+\])', text)
+        # Разрезаем текст по любым тегам формата [tag:val]
+        parts = re.split(r'(\[[a-z]+:[^\]]+\])', text)
 
         for part in parts:
             if not part: continue
 
-            tag_match = re.match(r'^\[([bic]):([a-zA-Z0-9#]+)\]$', part)
+            tag_match = re.match(r'^\[([a-z]+):([^\]]+)\]$', part)
             if tag_match:
-                tag_type, tag_val = tag_match.group(1), tag_match.group(2)
-                if tag_type == 'b':
-                    cur_b = (tag_val == '1')
-                elif tag_type == 'i':
-                    cur_i = (tag_val == '1')
-                elif tag_type == 'c':
-                    cur_c = None if tag_val == '0' else self._parse_color(tag_val, slide_ref, el_ref)
+                tag, val = tag_match.group(1), tag_match.group(2)
+                current_state[tag] = val  # Обновляем состояние
                 continue
 
             run = paragraph.add_run()
             run.text = part
-            run.font.name = self.DEFAULT_FONT
-            run.font.bold = cur_b
-            run.font.italic = cur_i
-            if base_sz: run.font.size = base_sz
-            if cur_c: run.font.color.rgb = cur_c
+
+            for tag, value in current_state.items():
+                if value is not None and tag in style_map:
+                    try:
+                        style_map[tag](run.font, value)
+                    except Exception:
+                        continue  # Игнорируем ошибки применения конкретного стиля
 
     def _apply_text(self, tf, data, slide_ref, el_ref):
         tf.clear()
