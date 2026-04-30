@@ -132,31 +132,28 @@ class PptxCreator:
     def _latex_to_omml(self, latex_str, size_pt):
         """ Конвертирует LaTeX в валидный объект PowerPoint OMML (DrawingML) """
         try:
-            # 0. Предобработка специфичных LaTeX макросов
-            # latex2mathml не знает argmin/argmax, превращаем их в математические операторы
-            latex_str = latex_str.replace(r'\argmin', r'\mathop{\mathrm{argmin}}')
-            latex_str = latex_str.replace(r'\argmax', r'\mathop{\mathrm{argmax}}')
+            # 1. Жесткая предобработка LaTeX-строки перед конвертацией
 
-            # --- АВТОРАСТЯГИВАНИЕ СКОБОК ДЛЯ ВСЕХ ТИПОВ МАТРИЦ ---
-            matrix_delimiters = {
-                'bmatrix': ('[', ']'),
-                'pmatrix': ('(', ')'),
-                'Bmatrix': (r'\{', r'\}'),
-                'vmatrix': ('|', '|'),
-                'Vmatrix': (r'\|', r'\|')
-            }
-            for m_type, (l_delim, r_delim) in matrix_delimiters.items():
-                pattern = r'\\begin\{' + m_type + r'\}(.*?)\\end\{' + m_type + r'\}'
-                repl = rf'\\left{l_delim} \\begin{{matrix}}\g<1>\\end{{matrix}} \\right{r_delim}'
-                latex_str = re.sub(pattern, repl, latex_str, flags=re.DOTALL)
-            # -----------------------------------------------------
+            # Фикс \argmin и \argmax (разбиваем на текст "arg" и оператор "\min", чтобы лимиты работали)
+            latex_str = latex_str.replace(r'\argmin', r'\mathrm{arg}\min')
+            latex_str = latex_str.replace(r'\argmax', r'\mathrm{arg}\max')
 
-            # 1. LaTeX -> MathML
+            # Фикс скобок матриц, чтобы они автоматически растягивались под размер дробей
+            latex_str = latex_str.replace(r'\begin{bmatrix}', r'\left[ \begin{matrix}')
+            latex_str = latex_str.replace(r'\end{bmatrix}', r'\end{matrix} \right]')
+            latex_str = latex_str.replace(r'\begin{pmatrix}', r'\left( \begin{matrix}')
+            latex_str = latex_str.replace(r'\end{pmatrix}', r'\end{matrix} \right)')
+            latex_str = latex_str.replace(r'\begin{Bmatrix}', r'\left\{ \begin{matrix}')
+            latex_str = latex_str.replace(r'\end{Bmatrix}', r'\end{matrix} \right\}')
+            latex_str = latex_str.replace(r'\begin{vmatrix}', r'\left| \begin{matrix}')
+            latex_str = latex_str.replace(r'\end{vmatrix}', r'\end{matrix} \right|')
+
+            # 2. LaTeX -> MathML
             mathml = latex2mathml.converter.convert(latex_str)
             if 'xmlns' not in mathml:
                 mathml = mathml.replace('<math', '<math xmlns="http://www.w3.org/1998/Math/MathML"', 1)
 
-            # 2. XSLT Transform
+            # 3. XSLT Transform (MathML -> OMML)
             xslt_tree = self._get_xslt()
             if xslt_tree is None:
                 return None
@@ -176,39 +173,39 @@ class PptxCreator:
 
             node = omml_nodes[0]
 
-            # 3. Адаптация OMML под PowerPoint
+            # 4. Адаптация OMML под PowerPoint
+
+            # Удаляем лишние вордовские теги
             for w_elem in node.xpath('.//w:*', namespaces={'w': w_ns}):
                 w_elem.getparent().remove(w_elem)
 
-            # --- ИСПРАВЛЕНИЕ АРТЕФАКТОВ СУММ, ИНТЕГРАЛОВ И ПРЕДЕЛОВ ---
-            for block in node.xpath('.//m:nary | .//m:limLow | .//m:limUpp', namespaces={'m': m_ns}):
-                e_elem = block.find('m:e', namespaces={'m': m_ns})
+            # --- ГЛАВНЫЙ ФИКС СУММ, ПРЕДЕЛОВ И ИНТЕГРАЛОВ ---
+            # XSLT создает суммы (m:nary) с пустой базой (m:e), а сами элементы ставит рядом.
+            # Мы берем всё, что стоит справа от суммы, и закидываем внутрь базы!
+            for op_block in node.xpath('.//m:nary | .//m:limLow | .//m:limUpp', namespaces={'m': m_ns}):
+                e_elem = op_block.find('m:e', namespaces={'m': m_ns})
                 if e_elem is not None:
-                    # Ищем ВЕСЬ текст внутри базы. Удаляем невидимые символы (zero-width spaces) и пробелы
-                    texts = e_elem.xpath('.//m:t/text()', namespaces={'m': m_ns})
-                    clean_text = re.sub(r'[\u200B-\u200F\u202A-\u202E\u205F-\u206F\s]', '', "".join(texts))
+                    # Полностью удаляем всё содержимое базы (там лежат невидимые пробелы/квадратики)
+                    for child in list(e_elem):
+                        e_elem.remove(child)
 
-                    # Проверяем, есть ли структурные элементы (дроби, другие суммы и т.д.)
-                    has_struct = len(e_elem.xpath('.//m:frac | .//m:rad | .//m:nary | .//m:d | .//m:func', namespaces={'m': m_ns})) > 0
-
-                    # Если база пустая (квадратик)
-                    if not clean_text and not has_struct:
-                        # Удаляем пустые элементы внутри квадратика
-                        for child in list(e_elem):
-                            e_elem.remove(child)
-                        # Забираем всё, что стоит справа от суммы, и кладем внутрь суммы
-                        for sibling in block.xpath('following-sibling::*'):
-                            e_elem.append(sibling)
+                    # Берем все элементы, которые идут ПОСЛЕ оператора, и переносим внутрь базы
+                    for sib in op_block.xpath('following-sibling::*'):
+                        e_elem.append(sib)
+            # ------------------------------------------------
 
             sz_val = str(int(size_pt * 100))
 
             def add_drawingml_props(parent_element, is_ctrl=False):
+                # noinspection PyAbstractClass
                 arPr = etree.Element(f"{{{a_ns}}}rPr")
-
                 if not is_ctrl:
+                    # noinspection PyUnresolvedReferences
                     arPr.set("sz", sz_val)
 
+                # noinspection PyAbstractClass
                 latin = etree.SubElement(arPr, f"{{{a_ns}}}latin")
+                # noinspection PyUnresolvedReferences
                 latin.set("typeface", self.math_font)
                 parent_element.insert(0, arPr)
 
@@ -218,23 +215,15 @@ class PptxCreator:
             for ctrlPr in node.xpath('.//m:ctrlPr', namespaces={'m': m_ns}):
                 add_drawingml_props(ctrlPr, is_ctrl=True)
 
-            # ЖЕСТКАЯ ОЧИСТКА ОТ КВАДРАТИКОВ (невидимых символов)
+            # Очистка невидимых символов
             for t in node.xpath('.//m:t', namespaces={'m': m_ns}):
                 if t.text:
                     t.text = re.sub(r'[\u200B-\u200F\u202A-\u202E\u205F-\u206F]', '', t.text)
 
-            for mr in node.xpath('.//m:r', namespaces={'m': m_ns}):
-                add_drawingml_props(mr, is_ctrl=False)
-
-            for ctrlPr in node.xpath('.//m:ctrlPr', namespaces={'m': m_ns}):
-                add_drawingml_props(ctrlPr, is_ctrl=True)
-
-            for t in node.xpath('.//m:t', namespaces={'m': m_ns}):
-                if t.text:
-                    t.text = re.sub(r'[\u200B-\u200F\u202A-\u202E\u205F-\u206F]', '', t.text)
-
-            # 4. Оборачиваем в математический контейнер
+            # 5. Оборачиваем в математический контейнер PowerPoint
+            # noinspection PyAbstractClass
             a14_m = etree.Element(f"{{{a14_ns}}}m")
+            # noinspection PyAbstractClass
             oMathPara = etree.SubElement(a14_m, f"{{{m_ns}}}oMathPara")
             oMathPara.append(node)
 
