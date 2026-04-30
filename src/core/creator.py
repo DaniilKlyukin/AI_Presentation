@@ -81,6 +81,8 @@ class PptxCreator:
         self.title_layout = self.prs.slide_layouts[self.layout_title_idx]
         self.content_layout = self.prs.slide_layouts[self.layout_content_idx]
 
+        self.math_font = os.getenv("PPT_MATH_FONT", "Cambria Math")
+
         self.formula_counter = 0
         self.warnings = []
         self._math_registry = {}
@@ -128,8 +130,27 @@ class PptxCreator:
             return None
 
     def _latex_to_omml(self, latex_str, size_pt):
-        """ Конвертирует LaTeX в валидный объект PowerPoint OMML """
+        """ Конвертирует LaTeX в валидный объект PowerPoint OMML (DrawingML) """
         try:
+            # 0. Предобработка специфичных LaTeX макросов
+            # latex2mathml не знает argmin/argmax, превращаем их в математические операторы
+            latex_str = latex_str.replace(r'\argmin', r'\mathop{\mathrm{argmin}}')
+            latex_str = latex_str.replace(r'\argmax', r'\mathop{\mathrm{argmax}}')
+
+            # --- АВТОРАСТЯГИВАНИЕ СКОБОК ДЛЯ ВСЕХ ТИПОВ МАТРИЦ ---
+            matrix_delimiters = {
+                'bmatrix': ('[', ']'),
+                'pmatrix': ('(', ')'),
+                'Bmatrix': (r'\{', r'\}'),
+                'vmatrix': ('|', '|'),
+                'Vmatrix': (r'\|', r'\|')
+            }
+            for m_type, (l_delim, r_delim) in matrix_delimiters.items():
+                pattern = r'\\begin\{' + m_type + r'\}(.*?)\\end\{' + m_type + r'\}'
+                repl = rf'\\left{l_delim} \\begin{{matrix}}\g<1>\\end{{matrix}} \\right{r_delim}'
+                latex_str = re.sub(pattern, repl, latex_str, flags=re.DOTALL)
+            # -----------------------------------------------------
+
             # 1. LaTeX -> MathML
             mathml = latex2mathml.converter.convert(latex_str)
             if 'xmlns' not in mathml:
@@ -144,35 +165,80 @@ class PptxCreator:
             tree = etree.fromstring(mathml.encode('utf-8'))
             omml_tree = transform(tree)
 
-            m_ns = self.m_ns
+            m_ns = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+            a_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+            w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            a14_ns = "http://schemas.microsoft.com/office/drawing/2010/main"
+
             omml_nodes = omml_tree.xpath('//m:oMath', namespaces={'m': m_ns})
             if not omml_nodes:
                 return None
 
             node = omml_nodes[0]
 
-            # 3. Размер шрифта: 1 pt = 2 единицы в OMML
-            sz_val = str(int(size_pt * 2))
+            # 3. Адаптация OMML под PowerPoint
+            for w_elem in node.xpath('.//w:*', namespaces={'w': w_ns}):
+                w_elem.getparent().remove(w_elem)
 
-            for rPr in node.xpath('.//m:rPr', namespaces={'m': m_ns}):
-                # Удаляем старые теги размера
-                for old_sz in rPr.xpath('./m:sz', namespaces={'m': m_ns}):
-                    rPr.remove(old_sz)
-                # Добавляем правильный размер
-                sz = etree.SubElement(rPr, "{%s}sz" % m_ns)
-                sz.set("{%s}val" % m_ns, sz_val)
-                # Шрифт Cambria Math (стандарт Office)
-                rf = etree.SubElement(rPr, "{%s}rFonts" % m_ns)
-                rf.set("{%s}ascii" % m_ns, "Cambria Math")
-                rf.set("{%s}hAnsi" % m_ns, "Cambria Math")
+            # --- ИСПРАВЛЕНИЕ АРТЕФАКТОВ СУММ, ИНТЕГРАЛОВ И ПРЕДЕЛОВ ---
+            for block in node.xpath('.//m:nary | .//m:limLow | .//m:limUpp', namespaces={'m': m_ns}):
+                e_elem = block.find('m:e', namespaces={'m': m_ns})
+                if e_elem is not None:
+                    # Ищем ВЕСЬ текст внутри базы. Удаляем невидимые символы (zero-width spaces) и пробелы
+                    texts = e_elem.xpath('.//m:t/text()', namespaces={'m': m_ns})
+                    clean_text = re.sub(r'[\u200B-\u200F\u202A-\u202E\u205F-\u206F\s]', '', "".join(texts))
 
-            # 4. Сериализация с гарантированным префиксом m:
-            xml_str = etree.tostring(node, encoding='unicode')
-            # На всякий случай добавляем xmlns:m, если его нет (обычно уже есть)
-            if 'xmlns:m' not in xml_str.split('>')[0]:
-                xml_str = xml_str.replace('<m:oMath', f'<m:oMath xmlns:m="{m_ns}"', 1)
+                    # Проверяем, есть ли структурные элементы (дроби, другие суммы и т.д.)
+                    has_struct = len(e_elem.xpath('.//m:frac | .//m:rad | .//m:nary | .//m:d | .//m:func', namespaces={'m': m_ns})) > 0
 
-            return parse_xml(xml_str)
+                    # Если база пустая (квадратик)
+                    if not clean_text and not has_struct:
+                        # Удаляем пустые элементы внутри квадратика
+                        for child in list(e_elem):
+                            e_elem.remove(child)
+                        # Забираем всё, что стоит справа от суммы, и кладем внутрь суммы
+                        for sibling in block.xpath('following-sibling::*'):
+                            e_elem.append(sibling)
+
+            sz_val = str(int(size_pt * 100))
+
+            def add_drawingml_props(parent_element, is_ctrl=False):
+                arPr = etree.Element(f"{{{a_ns}}}rPr")
+
+                if not is_ctrl:
+                    arPr.set("sz", sz_val)
+
+                latin = etree.SubElement(arPr, f"{{{a_ns}}}latin")
+                latin.set("typeface", self.math_font)
+                parent_element.insert(0, arPr)
+
+            for mr in node.xpath('.//m:r', namespaces={'m': m_ns}):
+                add_drawingml_props(mr, is_ctrl=False)
+
+            for ctrlPr in node.xpath('.//m:ctrlPr', namespaces={'m': m_ns}):
+                add_drawingml_props(ctrlPr, is_ctrl=True)
+
+            # ЖЕСТКАЯ ОЧИСТКА ОТ КВАДРАТИКОВ (невидимых символов)
+            for t in node.xpath('.//m:t', namespaces={'m': m_ns}):
+                if t.text:
+                    t.text = re.sub(r'[\u200B-\u200F\u202A-\u202E\u205F-\u206F]', '', t.text)
+
+            for mr in node.xpath('.//m:r', namespaces={'m': m_ns}):
+                add_drawingml_props(mr, is_ctrl=False)
+
+            for ctrlPr in node.xpath('.//m:ctrlPr', namespaces={'m': m_ns}):
+                add_drawingml_props(ctrlPr, is_ctrl=True)
+
+            for t in node.xpath('.//m:t', namespaces={'m': m_ns}):
+                if t.text:
+                    t.text = re.sub(r'[\u200B-\u200F\u202A-\u202E\u205F-\u206F]', '', t.text)
+
+            # 4. Оборачиваем в математический контейнер
+            a14_m = etree.Element(f"{{{a14_ns}}}m")
+            oMathPara = etree.SubElement(a14_m, f"{{{m_ns}}}oMathPara")
+            oMathPara.append(node)
+
+            return a14_m
         except Exception as e:
             print(f"[ERROR] Ошибка конвертации: {e}")
             return None
@@ -454,12 +520,16 @@ class PptxCreator:
         zout = zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED)
 
         math_map = self._pending_math
-        # Регистрируем пространства имен для корректной записи
         nsmap = {
             'a': "http://schemas.openxmlformats.org/drawingml/2006/main",
             'm': "http://schemas.openxmlformats.org/officeDocument/2006/math",
-            'p': "http://schemas.openxmlformats.org/presentationml/2006/main"
+            'p': "http://schemas.openxmlformats.org/presentationml/2006/main",
+            'a14': "http://schemas.microsoft.com/office/drawing/2010/main"
         }
+
+        # Регистрируем пространства имен глобально, чтобы они правильно записались в XML
+        for prefix, uri in nsmap.items():
+            etree.register_namespace(prefix, uri)
 
         for item in zin.infolist():
             data = zin.read(item.filename)
@@ -471,10 +541,10 @@ class PptxCreator:
                     t_node = run.find('a:t', namespaces=nsmap)
                     if t_node is not None and t_node.text in math_map:
                         math_xml = math_map[t_node.text]
-                        # Создаем элемент формулы из сохраненной строки
-                        new_node = etree.fromstring(math_xml)
+                        # Создаем элемент формулы из сохраненной строки (учитываем кодировку utf-8)
+                        new_node = etree.fromstring(math_xml.encode('utf-8'))
 
-                        # Заменяем старый <a:r> на <m:oMath> в родителе (<a:p>)
+                        # Заменяем старый <a:r> на математическую обертку <a14:m> внутри <a:p>
                         parent = run.getparent()
                         if parent is not None:
                             parent.replace(run, new_node)
