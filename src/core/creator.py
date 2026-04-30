@@ -1,23 +1,25 @@
 import os
 import re
-import marko
+import uuid
 from pathlib import Path
 from dotenv import load_dotenv
 
+import marko
 from pptx import Presentation
 from pptx.util import Pt, Inches, Cm
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
 from pptx.dml.color import RGBColor
 from pptx.oxml.xmlchemy import OxmlElement
+from pptx.oxml import parse_xml
 from pygments import lexers
 from pygments.lexers import get_lexer_by_name
-from pygments.token import Token
-from .errors import PptxSyntaxError
 import urllib.request
 import ssl
 from lxml import etree
 import latex2mathml.converter
-from pptx.oxml import parse_xml
+
+# Кастомные исключения
+from .errors import PptxSyntaxError
 
 env_path = Path(__file__).resolve().parent.parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
@@ -51,6 +53,7 @@ class PptxCreator:
         self.title_bg_color = os.getenv("PPT_TITLE_BG_COLOR", "")
         self.title_font_color = os.getenv("PPT_TITLE_FONT_COLOR", "0,0,0")
         self.title_height_cm = float(os.getenv("PPT_TITLE_HEIGHT_CM", "1.5"))
+
         self.slide_numbering = os.getenv("PPT_SLIDE_NUMBERING", "false").lower() == "true"
         self.footer_text = os.getenv("PPT_FOOTER_TEXT", "")
         self.footer_height_cm = float(os.getenv("PPT_FOOTER_HEIGHT_CM", "1.0"))
@@ -80,9 +83,12 @@ class PptxCreator:
 
         self.formula_counter = 0
         self.warnings = []
-        self.temp_files = []
+        self._math_registry = {}
         self.md_parser = marko.Markdown(extensions=['gfm'])
         self._xslt_cache = None
+        self.m_ns = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+        self._pending_math = {}  # ключ: placeholder_text, значение: omml_xml
+        etree.register_namespace('m', self.m_ns)  # гарантирует префикс m: в XSLT-выводе
 
     def _parse_color(self, color_str, default_rgb=(0, 0, 0)):
         if not color_str: return RGBColor(*default_rgb)
@@ -98,114 +104,99 @@ class PptxCreator:
         self.prs.slide_width, self.prs.slide_height = w, h
 
     def _get_xslt(self):
-        if self._xslt_cache is not None:
-            return self._xslt_cache
+        if self._xslt_cache: return self._xslt_cache
+        path = os.path.join(os.path.dirname(__file__), "MML2OMML.XSL")
 
-        xslt_path = os.path.join(os.path.dirname(__file__), "MML2OMML.XSL")
-        if os.path.exists(xslt_path):
+        if not os.path.exists(path):
+            url = "https://raw.githubusercontent.com/plutext/docx4j/master/docx4j-openxml-objects/src/main/resources/org/docx4j/convert/out/common/xslt/MML2OMML.XSL"
             try:
-                tree = etree.parse(xslt_path)
-                if 'stylesheet' in str(tree.getroot().tag).lower():
-                    self._xslt_cache = tree
-                    return tree
-            except:
-                os.remove(xslt_path)
-
-        urls = [
-            # Актуальный путь в репозитории docx4j
-            "https://raw.githubusercontent.com/plutext/docx4j/master/docx4j-openxml-objects/src/main/resources/org/docx4j/convert/out/common/xslt/MML2OMML.XSL",
-            # Запасное зеркало
-            "https://raw.githubusercontent.com/officediffs/officediffs/master/docx/MML2OMML.XSL"
-        ]
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        for url in urls:
-            try:
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
-                    if resp.getcode() == 200:
-                        content = resp.read()
-                        tree = etree.fromstring(content)
-                        with open(xslt_path, 'wb') as f: f.write(content)
-                        self._xslt_cache = etree.ElementTree(tree)
-                        return self._xslt_cache
-            except:
-                continue
-
-        return None
-
-    def _latex_to_omml(self, latex_str, size_pt):
-        try:
-            # Очистка LaTeX
-            latex_str = latex_str.replace(r'\text{', r'\mathrm{')
-
-            # 1. LaTeX -> MathML
-            mathml = latex2mathml.converter.convert(latex_str)
-            if not mathml: return None
-
-            # 2. Подготовка MathML (Namespace)
-            mathml_tree = etree.fromstring(mathml.encode('utf-8'))
-            NS_MATHML = "http://www.w3.org/1998/Math/MathML"
-            if not mathml_tree.tag.startswith(f"{{{NS_MATHML}}}"):
-                for elem in mathml_tree.iter():
-                    elem.tag = f"{{{NS_MATHML}}}{etree.QName(elem).localname}"
-
-            # 3. Transform
-            xslt = self._get_xslt()
-            if xslt is None: return None
-
-            transform = etree.XSLT(xslt)
-            omml_tree = transform(mathml_tree)
-
-            if not hasattr(omml_tree, 'getroot') or omml_tree.getroot() is None:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(url, context=ctx, timeout=10) as r:
+                    content = r.read()
+                    with open(path, 'wb') as f: f.write(content)
+            except Exception as e:
+                self.warnings.append(f"Failed to download XSLT for math: {str(e)}")
                 return None
 
-            # Находим oMath узел
-            omml_root = omml_tree.xpath('//*[local-name()="oMath"]')
-            if not omml_root: return None
-            omml_node = omml_root[0]
-
-            # 4. Настройка шрифтов (sz)
-            M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
-            sz_val = str(int(size_pt * 2))  # В OpenXML sz задается в полупунктах
-            for rPr in omml_node.xpath('.//*[local-name()="rPr"]'):
-                sz_elem = etree.SubElement(rPr, f"{{{M_NS}}}sz")
-                sz_elem.set(f"{{{M_NS}}}val", sz_val)
-
-            # 5. Сериализация в формат, который поймет pptx.oxml
-            xml_str = etree.tostring(omml_node, encoding='unicode')
-
-            # Исправляем префиксы для совместимости с PowerPoint
-            xml_str = xml_str.replace('xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"', '')
-            final_xml = f'<m:oMath xmlns:m="{M_NS}">{xml_str}</m:oMath>'
-            # Удаляем дублирующиеся вложенные теги oMath если они возникли
-            final_xml = re.sub(r'<m:oMath[^>]*>\s*<oMath[^>]*>', '<m:oMath>', final_xml)
-            final_xml = re.sub(r'</oMath>\s*</m:oMath>', '</m:oMath>', final_xml)
-            # Приводим все теги внутри к префиксу m:
-            final_xml = re.sub(r'<(?!/?m:)([^> /]+)', r'<m:\1', final_xml)
-            final_xml = re.sub(r'</(?!m:)([^> ]+)', r'</m:\1', final_xml)
-
-            return parse_xml(final_xml)
-
+        try:
+            self._xslt_cache = etree.parse(path)
+            return self._xslt_cache
         except Exception as e:
-            self.warnings.append(f"Ошибка рендера '{latex_str}': {e}")
+            self.warnings.append(f"Failed to parse XSLT: {str(e)}")
+            return None
+
+    def _latex_to_omml(self, latex_str, size_pt):
+        """ Конвертирует LaTeX в валидный объект PowerPoint OMML """
+        try:
+            # 1. LaTeX -> MathML
+            mathml = latex2mathml.converter.convert(latex_str)
+            if 'xmlns' not in mathml:
+                mathml = mathml.replace('<math', '<math xmlns="http://www.w3.org/1998/Math/MathML"', 1)
+
+            # 2. XSLT Transform
+            xslt_tree = self._get_xslt()
+            if xslt_tree is None:
+                return None
+
+            transform = etree.XSLT(xslt_tree)
+            tree = etree.fromstring(mathml.encode('utf-8'))
+            omml_tree = transform(tree)
+
+            m_ns = self.m_ns
+            omml_nodes = omml_tree.xpath('//m:oMath', namespaces={'m': m_ns})
+            if not omml_nodes:
+                return None
+
+            node = omml_nodes[0]
+
+            # 3. Размер шрифта: 1 pt = 2 единицы в OMML
+            sz_val = str(int(size_pt * 2))
+
+            for rPr in node.xpath('.//m:rPr', namespaces={'m': m_ns}):
+                # Удаляем старые теги размера
+                for old_sz in rPr.xpath('./m:sz', namespaces={'m': m_ns}):
+                    rPr.remove(old_sz)
+                # Добавляем правильный размер
+                sz = etree.SubElement(rPr, "{%s}sz" % m_ns)
+                sz.set("{%s}val" % m_ns, sz_val)
+                # Шрифт Cambria Math (стандарт Office)
+                rf = etree.SubElement(rPr, "{%s}rFonts" % m_ns)
+                rf.set("{%s}ascii" % m_ns, "Cambria Math")
+                rf.set("{%s}hAnsi" % m_ns, "Cambria Math")
+
+            # 4. Сериализация с гарантированным префиксом m:
+            xml_str = etree.tostring(node, encoding='unicode')
+            # На всякий случай добавляем xmlns:m, если его нет (обычно уже есть)
+            if 'xmlns:m' not in xml_str.split('>')[0]:
+                xml_str = xml_str.replace('<m:oMath', f'<m:oMath xmlns:m="{m_ns}"', 1)
+
+            return parse_xml(xml_str)
+        except Exception as e:
+            print(f"[ERROR] Ошибка конвертации: {e}")
             return None
 
     def _process_math_blocks(self, text):
-        def block_replacer(m):
-            raw = m.group(1).strip().replace('\\\\', '\\')
-            return f'\n\n⟪MATH_BLOCK:{raw}⟫\n\n'
+        """ Заменяет формулы на маркеры и выводит инфо в консоль """
+        self._math_registry = {}
 
-        text = re.sub(r'\$\$(.*?)\$\$', block_replacer, text, flags=re.DOTALL)
-        text = re.sub(r'\\\[(.*?)\\\]', block_replacer, text, flags=re.DOTALL)
+        def repl(m):
+            original = m.group(0)
+            is_block = original.startswith('$$')
+            latex = original.strip('$').strip()
+            marker_id = f"MATHM{uuid.uuid4().hex}X"
+            self._math_registry[marker_id] = (latex, is_block, original)
+            return marker_id
 
-        def inline_replacer(m):
-            return f'⟪MATH_INLINE:{m.group(1).strip()}⟫'
+        # Сначала блочные, потом строчные
+        text = re.sub(r'\$\$.*?\$\$', repl, text, flags=re.DOTALL)
+        text = re.sub(r'(?<!\$)\$(?!\$).*?\$', repl, text)
 
-        text = re.sub(r'(?<!\$)\$(?!\$)(.*?)(?<!\$)\$(?!\$)', inline_replacer, text)
-        text = re.sub(r'\\\((.*?)\\\)', inline_replacer, text)
+        print(f"[DEBUG] Найдено формул в блоке: {len(self._math_registry)}")
+        for mid, data in self._math_registry.items():
+            print(f"  - Маркер: {mid} | LaTeX: {data[0][:30]}...")
+
         return text
 
     def _apply_paragraph_style(self, paragraph, is_code=False, align=None, is_list_item=False):
@@ -300,6 +291,9 @@ class PptxCreator:
         p.space_before = Pt(tbl_shape.height.pt + 15)
 
     def _add_highlighted_code(self, text_frame, code_text, lang, slide, title_node, slide_idx):
+        # Восстанавливаем формулы в коде перед подсветкой
+        code_text = self._restore_math_in_text(code_text)
+
         lexer = get_lexer_by_name(lang) if lang else lexers.get_lexer_by_name('text')
         for line in code_text.replace('\t', '    ').splitlines():
             footer_h = Cm(self.footer_height_cm).inches if (self.footer_text or self.slide_numbering) else 0
@@ -309,6 +303,7 @@ class PptxCreator:
                 slide, text_frame = self._init_content_slide(title_node, slide_idx, is_continuation=True)
             p = self._get_or_add_paragraph(text_frame)
             self._apply_paragraph_style(p, is_code=True, align=PP_ALIGN.LEFT)
+
             for ttype, value in lexer.get_tokens(line):
                 if not value.strip('\r\n'): continue
                 run = p.add_run()
@@ -317,6 +312,14 @@ class PptxCreator:
                 key = str(ttype).split('.')[-1]
                 run.font.color.rgb = CODE_THEME.get(key, CODE_THEME['Other'])
         return text_frame, slide, slide_idx
+
+
+    def _restore_math_in_text(self, text):
+        """ Вспомогательный метод для восстановления исходного текста (для кода) """
+        for mid, data in self._math_registry.items():
+            text = text.replace(mid, data[2])
+        return text
+
 
     def _add_node_to_frame(self, text_frame, node, slide=None, level=0, default_align=None, is_list_item=False,
                            is_quote=False, title_node=None, slide_idx=0):
@@ -363,7 +366,6 @@ class PptxCreator:
         if node is None: return
         ntype = node.__class__.__name__
 
-        # Обработка стилей
         cur_bold = bold or ntype in ['Strong', 'StrongEmphasis']
         cur_italic = italic or ntype in ['Emphasis', 'Italic']
         is_code = (ntype == 'CodeSpan')
@@ -385,35 +387,38 @@ class PptxCreator:
             paragraph.add_run().text = " "
 
     def _create_run(self, paragraph, text, is_title, bold=False, italic=False, is_code=False):
-        if not text: return
-        parts = re.split(r'(⟪MATH_[A-Z]+:.*?⟫)', str(text))
+        if not text:
+            return
+
+        parts = re.split(r'(MATHM[a-f0-9]{32}X)', str(text))
         for part in parts:
-            if not part: continue
-            if part.startswith('⟪MATH_BLOCK:'):
-                latex = part[12:-1]
-                if self.formula_numbering:
-                    self.formula_counter += 1
-                    latex += f" \\qquad ({self.formula_counter})"
+            if part in self._math_registry:
+                latex, is_block, _ = self._math_registry[part]
+
+                placeholder_uuid = uuid.uuid4().hex
+                placeholder_text = f"«{placeholder_uuid}»"
+
                 omml = self._latex_to_omml(latex, self.title_size if is_title else self.body_size)
                 if omml is not None:
-                    paragraph.alignment = PP_ALIGN.CENTER
-                    paragraph._p.append(omml)
-                else:
-                    paragraph.add_run().text = f"[{latex}]"
-            elif part.startswith('⟪MATH_INLINE:'):
-                latex = part[13:-1]
-                omml = self._latex_to_omml(latex, self.title_size if is_title else self.body_size)
-                if omml is not None:
-                    paragraph._p.append(omml)
-                else:
-                    paragraph.add_run().text = latex
-            else:
+                    # ВАЖНО: Сохраняем только сам omml, без обертки в a:r
+                    self._pending_math[placeholder_text] = etree.tostring(omml, encoding='unicode')
+
+                run = paragraph.add_run()
+                run.text = placeholder_text
+                self._apply_run_style(run, is_title, bold, italic, False)
+            elif part:
                 run = paragraph.add_run()
                 run.text = part
-                run.font.name = self.code_font if is_code else self.font_name
-                run.font.size = Pt(self.code_size if is_code else (self.title_size if is_title else self.body_size))
-                if is_title: run.font.color.rgb = self._parse_color(self.title_font_color)
-                run.font.bold, run.font.italic = (bold or is_title), italic
+                self._apply_run_style(run, is_title, bold, italic, is_code)
+
+    def _apply_run_style(self, run, is_title, bold, italic, is_code):
+        run.font.name = self.code_font if is_code else self.font_name
+        size = self.code_size if is_code else (self.title_size if is_title else self.body_size)
+        run.font.size = Pt(size)
+        if is_title:
+            run.font.color.rgb = self._parse_color(self.title_font_color)
+        run.font.bold = (bold or is_title)
+        run.font.italic = italic
 
     def _add_footer_and_numbering(self, slide, slide_idx):
         sw, sh = self.prs.slide_width, self.prs.slide_height
@@ -421,6 +426,7 @@ class PptxCreator:
         by = sh - fh
         bc = self._parse_color(self.footer_border_color)
         nw = Cm(self.numbering_width_cm) if self.slide_numbering else 0
+
         if self.footer_text:
             fw = sw - margin * 2 - nw
             f_s = slide.shapes.add_textbox(margin, by, fw, fh)
@@ -428,6 +434,7 @@ class PptxCreator:
             p = f_s.text_frame.paragraphs[0]
             p.text, p.alignment = self.footer_text, PP_ALIGN.CENTER
             p.font.size, p.font.name = Pt(self.footer_font_size), self.font_name
+
         if self.slide_numbering:
             nl = margin + (sw - margin * 2 - nw) if self.footer_text else sw - margin - nw
             n_s = slide.shapes.add_textbox(nl, by, nw, fh)
@@ -436,6 +443,51 @@ class PptxCreator:
             p = n_s.text_frame.paragraphs[0]
             p.text, p.alignment = str(slide_idx), PP_ALIGN.CENTER
             p.font.size, p.font.bold, p.font.name = Pt(self.numbering_font_size), True, self.font_name
+
+    def _inject_math_placeholders(self, pptx_path):
+        import zipfile
+        import shutil
+        from lxml import etree
+
+        tmp_path = pptx_path + ".tmp"
+        zin = zipfile.ZipFile(pptx_path, 'r')
+        zout = zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED)
+
+        math_map = self._pending_math
+        # Регистрируем пространства имен для корректной записи
+        nsmap = {
+            'a': "http://schemas.openxmlformats.org/drawingml/2006/main",
+            'm': "http://schemas.openxmlformats.org/officeDocument/2006/math",
+            'p': "http://schemas.openxmlformats.org/presentationml/2006/main"
+        }
+
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename.startswith('ppt/slides/slide') and item.filename.endswith('.xml'):
+                root = etree.fromstring(data)
+
+                # Ищем все текстовые прогоны
+                for run in root.findall('.//a:r', namespaces=nsmap):
+                    t_node = run.find('a:t', namespaces=nsmap)
+                    if t_node is not None and t_node.text in math_map:
+                        math_xml = math_map[t_node.text]
+                        # Создаем элемент формулы из сохраненной строки
+                        new_node = etree.fromstring(math_xml)
+
+                        # Заменяем старый <a:r> на <m:oMath> в родителе (<a:p>)
+                        parent = run.getparent()
+                        if parent is not None:
+                            parent.replace(run, new_node)
+
+                # Сериализуем обратно
+                content = etree.tostring(root, encoding='utf-8', xml_declaration=True)
+                zout.writestr(item, content)
+            else:
+                zout.writestr(item, data)
+
+        zin.close()
+        zout.close()
+        shutil.move(tmp_path, pptx_path)
 
     def _init_content_slide(self, title_node, slide_idx, is_continuation=False):
         slide = self.prs.slides.add_slide(self.content_layout)
@@ -471,8 +523,9 @@ class PptxCreator:
         self._add_footer_and_numbering(slide, slide_num)
 
     def create_from_text(self, md_text, output_path):
+        self._pending_math.clear()
         self.warnings, self.formula_counter = [], 0
-        md_text = self._process_math_blocks(md_text)
+        md_text = self._process_math_blocks(md_text)  # Защищаем формулы перед marko
         blocks = [b for b in re.split(r'\n\s*---\s*\n', md_text.strip()) if b.strip()]
         if not blocks: raise PptxSyntaxError("MD текст пуст.")
 
@@ -480,7 +533,8 @@ class PptxCreator:
         for idx, block in enumerate(blocks):
             doc = self.md_parser.parse(block)
             if idx == 0:
-                self._create_title_slide(doc, slide_num); slide_num += 1
+                self._create_title_slide(doc, slide_num)
+                slide_num += 1
             else:
                 slide_num = self._create_content_slide(doc, slide_num) + 1
 
@@ -494,6 +548,9 @@ class PptxCreator:
                         p.alignment, p.font.bold = PP_ALIGN.CENTER, True
 
         self.prs.save(output_path)
+
+        self._inject_math_placeholders(output_path)
+
         return {"slides_created": total, "warnings": self.warnings}
 
     def _create_content_slide(self, doc, start_idx):
